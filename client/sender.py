@@ -25,12 +25,16 @@ load_env_file()
 
 BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 API_URL = f"{BASE_URL}/ingest"
+BULK_API_URL = f"{BASE_URL}/ingest/bulk"
 LATEST_URL = f"{BASE_URL}/latest"
 LOG_FILE = "sent_files.txt"
 RETRY_TOTAL = int(os.getenv("CLIENT_RETRY_TOTAL", "3"))
 RETRY_BACKOFF_FACTOR = float(os.getenv("CLIENT_RETRY_BACKOFF_FACTOR", "0.5"))
 ROW_RETRY_TOTAL = int(os.getenv("CLIENT_ROW_RETRY_TOTAL", "10"))
 REQUEST_TIMEOUT = float(os.getenv("CLIENT_REQUEST_TIMEOUT", "30"))
+SEND_MODE = os.getenv("CLIENT_SEND_MODE", "bulk").strip().lower()
+BULK_CHUNK_SIZE = max(1, int(os.getenv("CLIENT_BULK_CHUNK_SIZE", "1000")))
+REALTIME_DELAY_SECONDS = float(os.getenv("CLIENT_REALTIME_DELAY_SECONDS", "30"))
 
 
 def create_retry_session():
@@ -167,6 +171,72 @@ def send_row(row_dict, row_index):
     return False
 
 
+def dataframe_to_payload_rows(df):
+    payload_rows = []
+    for row in df.to_dict(orient="records"):
+        row["Date"] = row["Date"].isoformat()
+        row["Hour"] = int(row["Hour"])
+        row["Ontario Demand"] = float(row["Ontario Demand"])
+        payload_rows.append(row)
+    return payload_rows
+
+
+def send_bulk_rows(rows, start_index):
+    for attempt in range(1, ROW_RETRY_TOTAL + 1):
+        try:
+            response = session.post(
+                BULK_API_URL,
+                json={"rows": rows},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code != 200:
+                print(
+                    f"Bulk chunk starting at row {start_index} failed with status "
+                    f"{response.status_code} (attempt {attempt}/{ROW_RETRY_TOTAL})"
+                )
+                time.sleep(min(attempt * 2, 15))
+                continue
+
+            result = response.json()
+            print(
+                f"Bulk chunk starting at row {start_index}: "
+                f"saved={result.get('saved', 0)}, "
+                f"skipped={result.get('skipped', 0)}, "
+                f"invalid={result.get('invalid', 0)}"
+            )
+            return True
+        except requests.RequestException as exc:
+            print(
+                f"Error sending bulk chunk starting at row {start_index} "
+                f"(attempt {attempt}/{ROW_RETRY_TOTAL}): {exc}"
+            )
+            time.sleep(min(attempt * 2, 15))
+
+    return False
+
+
+def send_dataframe_bulk(df):
+    payload_rows = dataframe_to_payload_rows(df)
+    for start in range(0, len(payload_rows), BULK_CHUNK_SIZE):
+        chunk = payload_rows[start : start + BULK_CHUNK_SIZE]
+        if not send_bulk_rows(chunk, start):
+            return False
+    return True
+
+
+def send_dataframe_realtime(df):
+    for idx, row in df.iterrows():
+        row_dict = row.to_dict()
+        row_dict["Date"] = row_dict["Date"].isoformat()
+        if send_row(row_dict, idx):
+            time.sleep(REALTIME_DELAY_SECONDS)
+            continue
+
+        print(f"Stopping current file; row {idx} was not confirmed by the server")
+        return False
+    return True
+
+
 wait_for_server()
 processed_files = get_processed_files()
 latest_progress = get_latest_progress()
@@ -175,6 +245,11 @@ folder_path = os.path.join(base_dir, "..", "cleaner", "processed_.csv_file")
 
 print(f"Looking for CSV files in: {folder_path}")
 print(f"Folder exists: {os.path.exists(folder_path)}")
+print(f"Send mode: {SEND_MODE}")
+if SEND_MODE == "bulk":
+    print(f"Bulk chunk size: {BULK_CHUNK_SIZE}")
+else:
+    print(f"Realtime delay: {REALTIME_DELAY_SECONDS} seconds")
 
 csv_files = glob.glob(os.path.join(folder_path, "*.csv"))
 csv_files.sort()
@@ -227,18 +302,13 @@ else:
                 f"({format_progress(start_progress)} -> {format_progress(end_progress)})"
             )
 
-            file_successful = True
-            for idx, row in df.iterrows():
-                row_dict = row.to_dict()
-                row_dict["Date"] = row_dict["Date"].isoformat()
-                if send_row(row_dict, idx):
-                    latest_progress = (row["Date"], int(row["Hour"]))
-                    time.sleep(30)
-                    continue
+            if SEND_MODE == "realtime":
+                file_successful = send_dataframe_realtime(df)
+            else:
+                file_successful = send_dataframe_bulk(df)
 
-                file_successful = False
-                print(f"Stopping {filename}; row {idx} was not confirmed by the server")
-                break
+            if file_successful:
+                latest_progress = (df.iloc[-1]["Date"], int(df.iloc[-1]["Hour"]))
 
             if file_successful:
                 mark_as_processed(filename)
