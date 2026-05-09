@@ -31,6 +31,41 @@ STEP 2: DATA CHECK
 2. If you have multiple years, you can have several files (e.g., PUB_Demand_2023.P.csv).
 
 -----------------------------
+SENDER MODE: BULK OR REALTIME
+-----------------------------
+The sender behavior is controlled in the .env file:
+
+   CLIENT_SEND_MODE=bulk
+
+Current config lines:
+   - .env line 9: CLIENT_SEND_MODE=bulk ; =realtime, for live-style behavior
+   - .env line 10: CLIENT_BULK_CHUNK_SIZE=1000 ; The number of rows sent per request
+   - .env line 11: CLIENT_REALTIME_DELAY_SECONDS=30 ; wait time between rows
+   - .env line 12: MAX_BULK_INGEST_ROWS=5000
+
+Use bulk mode when you want to load historical data quickly for forecasting.
+In bulk mode, client/sender.py sends many rows at once to the server using:
+
+   /ingest/bulk
+
+Related code lines:
+   - client/sender.py line 28: BULK_API_URL points to /ingest/bulk
+   - client/sender.py line 35: reads CLIENT_SEND_MODE
+   - client/sender.py line 36: reads CLIENT_BULK_CHUNK_SIZE
+   - client/sender.py line 218: send_dataframe_bulk sends chunks of rows
+   - client/sender.py line 308: bulk mode calls send_dataframe_bulk
+   - server/app.py line 577: defines the /ingest/bulk endpoint
+   - server/app.py line 98: reads MAX_BULK_INGEST_ROWS
+
+Related code lines:
+   - client/sender.py line 37: reads CLIENT_REALTIME_DELAY_SECONDS
+   - client/sender.py line 227: send_dataframe_realtime sends one row at a time
+   - client/sender.py line 306: realtime mode calls send_dataframe_realtime
+
+So with CLIENT_SEND_MODE=realtime and CLIENT_REALTIME_DELAY_SECONDS=30, the sender
+will send one row every 30 seconds.
+
+-----------------------------
 STEP 3: START THE SYSTEM (LAPTOP 1)
 -----------------------------
 1. Double-click start_laptop1.bat
