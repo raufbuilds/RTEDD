@@ -233,7 +233,7 @@ else:
                 row_dict["Date"] = row_dict["Date"].isoformat()
                 if send_row(row_dict, idx):
                     latest_progress = (row["Date"], int(row["Hour"]))
-                    time.sleep(1)
+                    time.sleep(30)
                     continue
 
                 file_successful = False
