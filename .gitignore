@@ -206,3 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 data.db
+
+# gstack (global install)
+.amazonq/rules/gstack.md
