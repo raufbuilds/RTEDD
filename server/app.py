@@ -95,6 +95,7 @@ load_env_file()
 DB_PATH = os.getenv("DB_PATH", "data.db")
 DB_POOL_SIZE = max(1, int(os.getenv("DB_POOL_SIZE", "5")))
 MAX_REQUEST_SIZE_BYTES = int(os.getenv("MAX_REQUEST_SIZE_BYTES", str(1024 * 1024)))
+MAX_BULK_INGEST_ROWS = int(os.getenv("MAX_BULK_INGEST_ROWS", "5000"))
 FORECAST_REFRESH_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))
 FORECAST_XGBOOST_N_JOBS = int(os.getenv("FORECAST_XGBOOST_N_JOBS", "2"))
 
@@ -563,6 +564,77 @@ async def ingest(data: dict):
         conn.commit()
         inserted_id = curr.lastrowid
         return {"status": "saved", "id": inserted_id}
+
+
+def normalize_ingest_record(data: dict):
+    return (
+        data.get("Date"),
+        data.get("Hour"),
+        data.get("Ontario Demand"),
+    )
+
+
+@app.post("/ingest/bulk")
+async def ingest_bulk(data: dict):
+    rows = data.get("rows")
+    if not isinstance(rows, list):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "detail": "Expected a JSON body with a rows list."},
+        )
+
+    if len(rows) > MAX_BULK_INGEST_ROWS:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "status": "error",
+                "detail": f"Bulk ingest accepts at most {MAX_BULK_INGEST_ROWS} rows.",
+            },
+        )
+
+    normalized_rows = []
+    invalid = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            invalid += 1
+            continue
+
+        date_value, hour_value, demand_value = normalize_ingest_record(row)
+        if date_value is None or hour_value is None or demand_value is None:
+            invalid += 1
+            continue
+
+        normalized_rows.append((date_value, hour_value, demand_value))
+
+    saved = 0
+    skipped = 0
+    with get_connection() as conn:
+        curr = conn.cursor()
+        for date_value, hour_value, demand_value in normalized_rows:
+            curr.execute(
+                "SELECT id FROM demand WHERE date = ? AND hour = ? LIMIT 1",
+                (date_value, hour_value),
+            )
+            if curr.fetchone():
+                skipped += 1
+                continue
+
+            curr.execute(
+                "INSERT INTO demand (date, hour, demand) VALUES (?,?,?)",
+                (date_value, hour_value, demand_value),
+            )
+            saved += 1
+
+        conn.commit()
+
+    return {
+        "status": "saved",
+        "received": len(rows),
+        "valid": len(normalized_rows),
+        "saved": saved,
+        "skipped": skipped,
+        "invalid": invalid,
+    }
 
 
 @app.get("/records")
