@@ -16,14 +16,36 @@ SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
 BASE_URL = f"http://{SERVER_IP}:8000"
 STREAM_URL = f"{BASE_URL}/stream"
 RECORDS_URL = f"{BASE_URL}/records"
+RECORD_COUNT_URL = f"{BASE_URL}/records/count"
+FORECAST_URL = f"{BASE_URL}/forecast/latest"
+FORECAST_REFRESH_URL = f"{BASE_URL}/forecast/refresh"
 MAX_BUFFER_SIZE = 20000
-FORECAST_REFRESH_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))
+HOURS = list(range(24))
+FORECAST_POLL_SECONDS = 15
+FORECAST_FRESH_POLL_SECONDS = 60
 
 
 st.set_page_config(
     page_title="Real-Time Electricity Demand Dashboard",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    [data-testid="staleElement"],
+    [data-testid="stale-element"],
+    .stale-element,
+    .stApp [style*="opacity: 0"],
+    .stApp [style*="opacity:0"],
+    .stApp [style*="opacity: 0."],
+    .stApp [style*="opacity:0."] {
+        opacity: 1 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 st.title("Real-Time Electricity Demand Dashboard")
@@ -70,23 +92,18 @@ def ensure_state():
         "Today vs Live-Trained Forecast",
     }:
         st.session_state.view_mode = "Forecast Training Comparison"
-    # Forecast model caching
-    if "prophet_model" not in st.session_state:
-        st.session_state.prophet_model = None
-    if "xgboost_model" not in st.session_state:
-        st.session_state.xgboost_model = None
-    if "forecast_cache_time" not in st.session_state:
-        st.session_state.forecast_cache_time = 0
-    if "forecast_cache_data_hash" not in st.session_state:
-        st.session_state.forecast_cache_data_hash = None
-    if "forecast_cache_result" not in st.session_state:
-        st.session_state.forecast_cache_result = None
-    if "forecast_cache_target_date" not in st.session_state:
-        st.session_state.forecast_cache_target_date = None
-    if "forecast_cache_include_today" not in st.session_state:
-        st.session_state.forecast_cache_include_today = None
-    if "forecast_cache_results" not in st.session_state:
-        st.session_state.forecast_cache_results = {}
+    if "forecast_status" not in st.session_state:
+        st.session_state.forecast_status = None
+    if "forecast_trained_at" not in st.session_state:
+        st.session_state.forecast_trained_at = None
+    if "forecast_message" not in st.session_state:
+        st.session_state.forecast_message = None
+    if "forecast_cache" not in st.session_state:
+        st.session_state.forecast_cache = {}
+    if "total_records_received" not in st.session_state:
+        st.session_state.total_records_received = 0
+    if "last_record_count_fetch" not in st.session_state:
+        st.session_state.last_record_count_fetch = 0
 
 
 def coerce_date_range_value(value):
@@ -197,6 +214,139 @@ def load_history():
     st.session_state.history_loaded = True
     if loaded:
         st.session_state.last_error = None
+    fetch_total_records_received(force=True)
+
+
+def fetch_total_records_received(force=False):
+    now = time.time()
+    if not force and now - st.session_state.last_record_count_fetch < 5:
+        return st.session_state.total_records_received
+
+    try:
+        response = requests.get(RECORD_COUNT_URL, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException:
+        return max(st.session_state.total_records_received, len(st.session_state.records))
+
+    total_records = int(payload.get("total_records", 0))
+    st.session_state.total_records_received = total_records
+    st.session_state.last_record_count_fetch = now
+    return total_records
+
+
+def request_forecast_refresh(target_date=None, include_target_date=False):
+    params: dict[str, Any] = {"include_target_date": include_target_date}
+    if target_date is not None:
+        params["target_date"] = pd.Timestamp(target_date).date().isoformat()
+
+    try:
+        response = requests.post(FORECAST_REFRESH_URL, params=params, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        st.session_state.forecast_status = payload.get("status")
+        st.session_state.forecast_message = "Forecast refresh queued"
+        if target_date is None:
+            st.session_state.forecast_cache.clear()
+        else:
+            st.session_state.forecast_cache.pop(
+                forecast_client_cache_key(target_date, include_target_date),
+                None,
+            )
+        st.session_state.last_error = None
+        return True
+    except requests.RequestException as exc:
+        st.session_state.last_error = f"Forecast refresh failed: {exc}"
+        return False
+
+
+def forecast_client_cache_key(target_date=None, include_target_date=False):
+    if target_date is None:
+        target_key = None
+    else:
+        target_key = pd.Timestamp(target_date).date().isoformat()
+    return (target_key, bool(include_target_date))
+
+
+def empty_forecast_frame():
+    return pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"])
+
+
+def forecast_frame_from_rows(forecast_rows):
+    if not forecast_rows:
+        return empty_forecast_frame()
+
+    forecast_df = pd.DataFrame(forecast_rows)
+    for column in ["Hour", "Prophet", "XGBoost", "Ensemble"]:
+        if column not in forecast_df.columns:
+            forecast_df[column] = pd.NA
+        forecast_df[column] = pd.to_numeric(forecast_df[column], errors="coerce")
+
+    forecast_df = forecast_df.dropna(subset=["Hour"])
+    forecast_df["Hour"] = forecast_df["Hour"].astype(int)
+    return forecast_df[["Hour", "Prophet", "XGBoost", "Ensemble"]].sort_values("Hour")
+
+
+def forecast_poll_interval(status):
+    if status in {"fresh", "failed", "empty"}:
+        return FORECAST_FRESH_POLL_SECONDS
+    return FORECAST_POLL_SECONDS
+
+
+def fetch_cached_forecast(target_date=None, include_target_date=False):
+    cache_key = forecast_client_cache_key(target_date, include_target_date)
+    cached = st.session_state.forecast_cache.get(cache_key)
+    now = time.time()
+    if cached is not None:
+        age = now - cached.get("fetched_at", 0)
+        interval = forecast_poll_interval(cached.get("status"))
+        if age < interval:
+            return forecast_frame_from_rows(cached.get("forecast") or [])
+
+    params: dict[str, Any] = {"include_target_date": include_target_date}
+    if target_date is not None:
+        params["target_date"] = pd.Timestamp(target_date).date().isoformat()
+
+    try:
+        response = requests.get(FORECAST_URL, params=params, timeout=5)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        st.session_state.last_error = f"Forecast fetch failed: {exc}"
+        if cached is not None:
+            return forecast_frame_from_rows(cached.get("forecast") or [])
+        return empty_forecast_frame()
+
+    st.session_state.forecast_status = payload.get("status")
+    st.session_state.forecast_trained_at = payload.get("trained_at")
+    st.session_state.forecast_message = payload.get("message")
+    st.session_state.forecast_cache[cache_key] = {
+        "fetched_at": now,
+        "status": payload.get("status"),
+        "forecast": payload.get("forecast") or [],
+    }
+
+    if payload.get("error"):
+        st.session_state.last_error = f"Forecast error: {payload['error']}"
+
+    return forecast_frame_from_rows(payload.get("forecast") or [])
+
+
+def forecast_status_text():
+    status = st.session_state.forecast_status
+    trained_at = st.session_state.forecast_trained_at
+    message = st.session_state.forecast_message
+
+    parts = []
+    if status:
+        parts.append(f"Forecast status: {status}")
+    if trained_at:
+        trained_time = pd.to_datetime(float(trained_at), unit="s").strftime("%Y-%m-%d %H:%M:%S")
+        parts.append(f"last trained {trained_time}")
+    if message:
+        parts.append(message)
+
+    return " | ".join(parts)
 
 
 def enqueue_latest(data_queue, record):
@@ -327,242 +477,11 @@ def compute_hourly_baseline(df, threshold=3.0):
     return baseline
 
 
-def forecast_training_frame(df, target_date=None, include_target_date=False):
-    if df.empty:
-        return df
-
-    if target_date is None:
-        target_date = df["Date"].max()
-
-    if include_target_date:
-        return df.copy()
-
-    historical_df = df[df["Date"] < pd.Timestamp(target_date)].copy()
-    if len(historical_df) >= 48:
-        return historical_df
-
-    return df.copy()
-
-
-def forecast_cache_signature(df, target_date=None, include_target_date=False):
-    if df.empty:
-        return (0, None, None, None, include_target_date)
-
-    if target_date is None:
-        target_date = df["Date"].max()
-
-    latest_ts = df["Timestamp"].max() if "Timestamp" in df.columns else None
-    earliest_ts = df["Timestamp"].min() if "Timestamp" in df.columns else None
-    return (
-        len(df),
-        pd.Timestamp(earliest_ts).isoformat() if pd.notna(earliest_ts) else None,
-        pd.Timestamp(latest_ts).isoformat() if pd.notna(latest_ts) else None,
-        pd.Timestamp(target_date).date().isoformat(),
-        include_target_date,
-    )
-
-
-def forecast_with_prophet(df, target_date=None):
-    """
-    Use Prophet to forecast expected demand for each hour of a target date.
-    Returns a DataFrame with Hour and Predicted columns.
-    """
-    if df.empty or len(df) < 24:
-        return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
-
-    try:
-        from prophet import Prophet
-
-        # Prepare data for Prophet (requires 'ds' and 'y' columns)
-        prophet_df = df[["Timestamp", "Ontario Demand"]].copy()
-        prophet_df = prophet_df.dropna()
-        prophet_df = prophet_df.rename(columns={"Timestamp": "ds", "Ontario Demand": "y"})
-
-        if len(prophet_df) < 24:
-            return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
-
-        # Fit Prophet model
-        model = Prophet(
-            daily_seasonality='auto',
-            weekly_seasonality='auto',
-            yearly_seasonality='auto',
-            changepoint_prior_scale=0.05,
-        )
-        model.fit(prophet_df)
-
-        # Generate forecast for target date
-        if target_date is None:
-            target_date = df["Date"].max()
-
-        # Create future dataframe for 24 hours
-        future_dates = []
-        for hour in range(24):
-            future_dates.append(pd.Timestamp(target_date).replace(hour=hour))
-        future_df = pd.DataFrame({"ds": future_dates})
-
-        # Make predictions
-        forecast = model.predict(future_df)
-        result = pd.DataFrame({
-            "Hour": range(24),
-            "Prophet Predicted": forecast["yhat"].values
-        })
-        return result
-    except ImportError:
-        return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
-    except Exception as e:
-        st.session_state.last_error = f"Prophet forecast error: {e}"
-        return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
-
-
-def forecast_with_xgboost(df, target_date=None):
-    """
-    Use XGBoost with engineered features to predict expected demand.
-    Returns a DataFrame with Hour and XGBoost Predicted columns.
-    """
-    if df.empty or len(df) < 48:
-        return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
-
-    try:
-        from xgboost import XGBRegressor
-
-        # Feature engineering
-        df_features = df.copy()
-        df_features = df_features.dropna(subset=["Timestamp", "Ontario Demand"])
-
-        if len(df_features) < 48:
-            return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
-
-        # Create time-based features
-        df_features["hour"] = df_features["Timestamp"].dt.hour
-        df_features["day_of_week"] = df_features["Timestamp"].dt.dayofweek
-        df_features["day_of_month"] = df_features["Timestamp"].dt.day
-        df_features["month"] = df_features["Timestamp"].dt.month
-        df_features["is_weekend"] = (df_features["day_of_week"] >= 5).astype(int)
-
-        # Lag features (previous hour, same hour yesterday)
-        df_features = df_features.sort_values("Timestamp")
-        df_features["demand_lag_1"] = df_features["Ontario Demand"].shift(1)
-        df_features["demand_lag_24"] = df_features["Ontario Demand"].shift(24)
-
-        # Rolling statistics
-        df_features["rolling_mean_24"] = df_features["Ontario Demand"].rolling(24).mean()
-        df_features["rolling_std_24"] = df_features["Ontario Demand"].rolling(24).std()
-
-        # Drop rows with NaN values from lag/rolling features
-        df_features = df_features.dropna()
-
-        if len(df_features) < 24:
-            return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
-
-        # Define features
-        feature_cols = ["hour", "day_of_week", "day_of_month", "month", "is_weekend",
-                        "demand_lag_1", "demand_lag_24", "rolling_mean_24", "rolling_std_24"]
-
-        X = df_features[feature_cols]
-        y = df_features["Ontario Demand"]
-
-        # Train model
-        model = XGBRegressor(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            random_state=42,
-            n_jobs=-1,
-        )
-        model.fit(X, y)
-
-        # Predict for target date
-        if target_date is None:
-            target_date = df["Date"].max()
-
-        target_ts = pd.Timestamp(target_date)
-        predictions = []
-
-        for hour in range(24):
-            # Create feature vector for this hour
-            features = {
-                "hour": hour,
-                "day_of_week": target_ts.dayofweek,
-                "day_of_month": target_ts.day,
-                "month": target_ts.month,
-                "is_weekend": 1 if target_ts.dayofweek >= 5 else 0,
-                "demand_lag_1": df_features["Ontario Demand"].iloc[-1] if len(df_features) > 0 else 0,
-                "demand_lag_24": df_features[df_features["Timestamp"] < target_ts - pd.Timedelta(hours=24)]["Ontario Demand"].mean() if len(df_features) > 24 else 0,
-                "rolling_mean_24": df_features["Ontario Demand"].tail(24).mean() if len(df_features) >= 24 else 0,
-                "rolling_std_24": df_features["Ontario Demand"].tail(24).std() if len(df_features) >= 24 else 0,
-            }
-            predictions.append(features)
-
-        pred_df = pd.DataFrame(predictions)
-        pred_df = pred_df[feature_cols]
-        forecasted = model.predict(pred_df)
-
-        result = pd.DataFrame({
-            "Hour": range(24),
-            "XGBoost Predicted": forecasted
-        })
-        return result
-    except ImportError:
-        return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
-    except Exception as e:
-        st.session_state.last_error = f"XGBoost forecast error: {e}"
-        return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
-
-
 def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
     """
-    Combine Prophet and XGBoost predictions with weighted average.
-    Returns DataFrame with Hour, Prophet, XGBoost, and Ensemble columns.
+    Fetch the latest cached Prophet/XGBoost ensemble forecast from FastAPI.
     """
-    training_df = forecast_training_frame(df, target_date, include_target_date)
-    target_date_value = pd.Timestamp(target_date or df["Date"].max()).date()
-    signature = forecast_cache_signature(training_df, target_date_value, include_target_date)
-    cache_key = (target_date_value.isoformat(), include_target_date)
-    cached = st.session_state.forecast_cache_results.get(cache_key)
-
-    if (
-        cached is not None
-        and cached["signature"] == signature
-        and time.time() - cached["created_at"] < FORECAST_REFRESH_SECONDS
-    ):
-        return cached["result"].copy()
-
-    prophet_forecast = forecast_with_prophet(training_df, target_date)
-    xgboost_forecast = forecast_with_xgboost(training_df, target_date)
-
-    if prophet_forecast.empty and xgboost_forecast.empty:
-        return pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"])
-
-    # Merge forecasts
-    if prophet_forecast.empty:
-        result = xgboost_forecast.rename(columns={"XGBoost Predicted": "Ensemble"})
-        result["Prophet"] = result["Ensemble"]
-        result["XGBoost"] = result["Ensemble"]
-    elif xgboost_forecast.empty:
-        result = prophet_forecast.rename(columns={"Prophet Predicted": "Ensemble"})
-        result["Prophet"] = result["Ensemble"]
-        result["XGBoost"] = result["Ensemble"]
-    else:
-        merged = pd.merge(prophet_forecast, xgboost_forecast, on="Hour", how="outer")
-        # Weighted ensemble (Prophet: 0.4, XGBoost: 0.6)
-        merged["Ensemble"] = 0.4 * merged["Prophet Predicted"] + 0.6 * merged["XGBoost Predicted"]
-        result = merged.rename(columns={
-            "Prophet Predicted": "Prophet",
-            "XGBoost Predicted": "XGBoost"
-        })
-
-    result = result[["Hour", "Prophet", "XGBoost", "Ensemble"]]
-    st.session_state.forecast_cache_result = result.copy()
-    st.session_state.forecast_cache_data_hash = signature
-    st.session_state.forecast_cache_target_date = target_date_value
-    st.session_state.forecast_cache_include_today = include_target_date
-    st.session_state.forecast_cache_time = time.time()
-    st.session_state.forecast_cache_results[cache_key] = {
-        "created_at": st.session_state.forecast_cache_time,
-        "signature": signature,
-        "result": result.copy(),
-    }
-    return result
+    return fetch_cached_forecast(target_date, include_target_date)
 
 
 def add_baseline_to_figure(fig, baseline, hours, title_suffix=""):
@@ -612,6 +531,18 @@ def add_baseline_to_figure(fig, baseline, hours, title_suffix=""):
     return fig
 
 
+def fix_hour_axis(fig):
+    fig.update_xaxes(
+        title_text="Hour",
+        range=[-0.5, 23.5],
+        tickmode="array",
+        tickvals=HOURS,
+        ticktext=[str(hour) for hour in HOURS],
+        dtick=1,
+    )
+    return fig
+
+
 def add_anomaly_markers(fig, df_with_anomaly, label_col=None):
     anomalies = df_with_anomaly[df_with_anomaly["Anomaly"]].copy()
     if anomalies.empty:
@@ -656,6 +587,8 @@ def sidebar_controls(df):
     )
     if st.sidebar.button("Refresh now", key="refresh_now"):
         st.rerun()
+    if st.sidebar.button("Refresh forecast", key="refresh_forecast"):
+        request_forecast_refresh()
 
     st.sidebar.subheader("Scope")
     scope = st.sidebar.selectbox(
@@ -671,23 +604,23 @@ def sidebar_controls(df):
         today = pd.Timestamp.today().date()
         min_date, max_date = today, today
 
-    st.session_state.date_range = clamp_date_range(
+    date_range = clamp_date_range(
         st.session_state.date_range,
         min_date,
         max_date,
     )
+    st.session_state.date_range = date_range
 
-    date_range = st.session_state.date_range
     if scope == "Custom date range":
-        date_range = st.sidebar.date_input(
+        selected_date_range = st.sidebar.date_input(
             "Date range",
-            value=st.session_state.date_range,
+            value=date_range,
             min_value=min_date,
             max_value=max_date,
-            key="date_range",
+            key="date_range_input",
         )
-        st.session_state.date_range = clamp_date_range(date_range, min_date, max_date)
-        date_range = st.session_state.date_range
+        date_range = clamp_date_range(selected_date_range, min_date, max_date)
+        st.session_state.date_range = date_range
 
     st.sidebar.subheader("Filters")
     hour_range = st.sidebar.slider("Hour range", 0, 23, key="hour_range")
@@ -793,14 +726,16 @@ def build_scope_label(df_view, scope, hour_range):
     return f"{scope_label} | {hour_label}"
 
 
-def render_metrics(df):
+def render_metrics(df, total_records_received=None):
     peak = df["Ontario Demand"].max()
     avg = df["Ontario Demand"].mean()
+    if total_records_received is None:
+        total_records_received = len(df)
 
     cols = st.columns(3)
     cols[0].metric("Peak Demand", f"{peak:.0f} MW" if pd.notna(peak) else "N/A")
     cols[1].metric("Avg Demand", f"{avg:.0f} MW" if pd.notna(avg) else "N/A")
-    cols[2].metric("Total Records", f"{len(df)}")
+    cols[2].metric("Total Records", f"{total_records_received}")
 
     if df["Anomaly"].any():
         st.warning(f"{int(df['Anomaly'].sum())} anomalies detected")
@@ -824,27 +759,208 @@ def render_today(df, scope_label, baseline=None):
         markers=True,
     )
     baseline_df = baseline if baseline is not None else pd.DataFrame()
-    fig = add_baseline_to_figure(fig, baseline_df, sorted(df_today["Hour"].unique()))
+    fig = add_baseline_to_figure(fig, baseline_df, HOURS)
     fig = add_anomaly_markers(fig, df_today)
+    fig = fix_hour_axis(fig)
     fig.update_layout(hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
 
 def render_all_dates(df, scope_label):
-    fig = px.line(
-        df,
-        x="Hour",
-        y="Ontario Demand",
-        color="Date Label",
-        title=f"All Dates | {scope_label}",
-        markers=True,
+    daily_count = df["Date"].nunique()
+    if daily_count <= 1:
+        render_today(df, scope_label)
+        return
+
+    st.subheader("All Dates Overview")
+
+    hourly = (
+        df.groupby(["Date", "Date Label", "Hour"], as_index=False)["Ontario Demand"]
+        .mean()
+        .sort_values(["Date", "Hour"])
     )
-    st.plotly_chart(fig, use_container_width=True)
+    heatmap_data = hourly.pivot(
+        index="Date Label",
+        columns="Hour",
+        values="Ontario Demand",
+    )
+    heatmap_data = heatmap_data.reindex(HOURS, axis=1)
+
+    fig_heatmap = go.Figure(
+        data=go.Heatmap(
+            x=HOURS,
+            y=heatmap_data.index,
+            z=heatmap_data.values,
+            colorscale="Viridis",
+            colorbar=dict(title="MW"),
+            hovertemplate="Date: %{y}<br>Hour: %{x}:00<br>Demand: %{z:.1f} MW<extra></extra>",
+        )
+    )
+    anomaly_points = df[df["Anomaly"]].copy()
+    if not anomaly_points.empty:
+        fig_heatmap.add_trace(
+            go.Scatter(
+                x=anomaly_points["Hour"],
+                y=anomaly_points["Date Label"],
+                mode="markers",
+                marker=dict(size=8, color="#d62728", symbol="x"),
+                name="Anomaly",
+                customdata=anomaly_points[
+                    ["Ontario Demand", "Expected Demand", "Deviation", "Anomaly Score"]
+                ].to_numpy(),
+                hovertemplate=(
+                    "Date: %{y}<br>"
+                    "Hour: %{x}:00<br>"
+                    "Demand: %{customdata[0]:.1f} MW<br>"
+                    "Expected: %{customdata[1]:.1f} MW<br>"
+                    "Deviation: %{customdata[2]:.1f} MW<br>"
+                    "Score: %{customdata[3]:.2f}<extra></extra>"
+                ),
+            )
+        )
+    fig_heatmap.update_layout(
+        title=f"Demand Heatmap by Date and Hour | {scope_label}",
+        xaxis_title="Hour",
+        yaxis_title="Date",
+        yaxis=dict(autorange="reversed"),
+        height=max(420, min(900, 26 * daily_count + 180)),
+        hovermode="closest",
+    )
+    fig_heatmap = fix_hour_axis(fig_heatmap)
+    st.plotly_chart(fig_heatmap, use_container_width=True)
+
+    left_col, right_col = st.columns(2)
+
+    daily_summary = (
+        df.groupby(["Date", "Date Label"], as_index=False)
+        .agg(
+            Average_Demand=("Ontario Demand", "mean"),
+            Peak_Demand=("Ontario Demand", "max"),
+            Minimum_Demand=("Ontario Demand", "min"),
+            Records=("Ontario Demand", "size"),
+        )
+        .sort_values("Date")
+    )
+    daily_summary_melted = daily_summary.melt(
+        id_vars=["Date", "Date Label"],
+        value_vars=["Average_Demand", "Peak_Demand", "Minimum_Demand"],
+        var_name="Series",
+        value_name="Demand",
+    )
+    daily_summary_melted["Series"] = daily_summary_melted["Series"].str.replace("_", " ")
+
+    with left_col:
+        fig_daily = px.line(
+            daily_summary_melted,
+            x="Date",
+            y="Demand",
+            color="Series",
+            markers=True,
+            title="Daily Demand Summary",
+            color_discrete_map={
+                "Average Demand": "#1f77b4",
+                "Peak Demand": "#d62728",
+                "Minimum Demand": "#2ca02c",
+            },
+        )
+        fig_daily.update_layout(hovermode="x unified", xaxis_title="Date", yaxis_title="MW")
+        st.plotly_chart(fig_daily, use_container_width=True)
+
+    hourly_profile = (
+        df.groupby("Hour")["Ontario Demand"]
+        .agg(
+            Median="median",
+            P10=lambda series: series.quantile(0.10),
+            P90=lambda series: series.quantile(0.90),
+            Minimum="min",
+            Maximum="max",
+        )
+        .reset_index()
+        .sort_values("Hour")
+    )
+    latest_date = df["Date"].max()
+    latest_profile = (
+        df[df["Date"] == latest_date]
+        .groupby("Hour", as_index=False)["Ontario Demand"]
+        .mean()
+        .sort_values("Hour")
+    )
+
+    with right_col:
+        fig_profile = go.Figure()
+        fig_profile.add_trace(
+            go.Scatter(
+                x=hourly_profile["Hour"],
+                y=hourly_profile["P90"],
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        fig_profile.add_trace(
+            go.Scatter(
+                x=hourly_profile["Hour"],
+                y=hourly_profile["P10"],
+                mode="lines",
+                fill="tonexty",
+                fillcolor="rgba(31, 119, 180, 0.18)",
+                line=dict(width=0),
+                name="10-90% range",
+                hovertemplate="Hour: %{x}<br>10th percentile: %{y:.1f} MW<extra></extra>",
+            )
+        )
+        fig_profile.add_trace(
+            go.Scatter(
+                x=hourly_profile["Hour"],
+                y=hourly_profile["Median"],
+                mode="lines+markers",
+                line=dict(color="#1f77b4", width=3),
+                marker=dict(size=6),
+                name="Median",
+                hovertemplate="Hour: %{x}<br>Median: %{y:.1f} MW<extra></extra>",
+            )
+        )
+        fig_profile.add_trace(
+            go.Scatter(
+                x=latest_profile["Hour"],
+                y=latest_profile["Ontario Demand"],
+                mode="lines+markers",
+                line=dict(color="#d62728", width=3),
+                marker=dict(size=7),
+                name=f"Latest date ({latest_date.date()})",
+                hovertemplate="Hour: %{x}<br>Latest: %{y:.1f} MW<extra></extra>",
+            )
+        )
+        fig_profile.update_layout(
+            title="Typical Hourly Range vs Latest Date",
+            yaxis_title="MW",
+            hovermode="x unified",
+        )
+        fig_profile = fix_hour_axis(fig_profile)
+        st.plotly_chart(fig_profile, use_container_width=True)
+
+    with st.expander("Daily summary table"):
+        display_summary = daily_summary.rename(
+            columns={
+                "Average_Demand": "Average Demand",
+                "Peak_Demand": "Peak Demand",
+                "Minimum_Demand": "Minimum Demand",
+            }
+        )
+        st.dataframe(
+            display_summary[
+                ["Date Label", "Average Demand", "Peak Demand", "Minimum Demand", "Records"]
+            ].round(1),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def render_average(df, scope_label):
     df_avg = df.groupby("Hour", as_index=False)["Ontario Demand"].mean()
     fig = px.line(df_avg, x="Hour", y="Ontario Demand", title=f"Average Demand | {scope_label}", markers=True)
+    fig = fix_hour_axis(fig)
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -892,6 +1008,11 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
         latest_date,
         include_target_date=include_today_in_training,
     )
+    status_text = forecast_status_text()
+    if status_text:
+        st.caption(status_text)
+    if forecast_df.empty and st.session_state.forecast_status in {"training", "stale"}:
+        st.info("Forecast training is running in FastAPI. Cached forecast data will appear after it finishes.")
 
     # Merge all forecasts
     merged = pd.merge(today_df, avg_df, on="Hour", how="outer").sort_values("Hour")
@@ -970,6 +1091,7 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
             )
         )
 
+    fig = fix_hour_axis(fig)
     fig.update_layout(hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -1043,6 +1165,7 @@ def render_latest_7_days(df, scope_label):
         title=f"Latest 7 Dates | {scope_label}",
         markers=True,
     )
+    fig = fix_hour_axis(fig)
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -1106,6 +1229,7 @@ def render_chart(df, view_mode, baseline, scope_label):
 
 def render_dashboard_content(view, scope, date_range, hour_range, show_normal_rows):
     queue_changed = drain_queue()
+    total_records_received = fetch_total_records_received(force=queue_changed)
     df = dataframe_from_state()
     if not df.empty:
         df = calculate_anomalies(df)
@@ -1124,7 +1248,7 @@ def render_dashboard_content(view, scope, date_range, hour_range, show_normal_ro
     if df_view.empty:
         st.warning(f"No data matches the selected scope/filters. Active view: {scope_label}")
     else:
-        render_metrics(df_view)
+        render_metrics(df_view, total_records_received=total_records_received)
         st.caption(f"Active scope: {scope_label}")
         render_chart(df_view, view, baseline, scope_label)
 
