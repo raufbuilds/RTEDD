@@ -1,121 +1,181 @@
-
 ============================================================
 Real-Time Electricity Demand Dashboard - SETUP & USER GUIDE
 ============================================================
 
-This guide explains how to set up and run the Real-Time Electricity Demand Dashboard system.
+This project runs a FastAPI server, a data sender, and a Streamlit dashboard for
+real-time electricity demand monitoring and forecasting.
+
+The current forecasting setup is server-backed:
+- FastAPI stores all demand rows in data.db.
+- FastAPI prepares dashboard records, anomaly fields, and the baseline band.
+- FastAPI trains and caches Prophet + LightGBM forecast results.
+- Streamlit only fetches prepared data and renders charts, filters, tables, and controls.
 
 -----------------------------
 PREREQUISITES
 -----------------------------
-1. Python 3.10 or higher must be installed.
+1. Python 3.10 or higher.
    - Download from: https://www.python.org/downloads/
-   - During installation, make sure to check "Add Python to PATH".
+   - During installation, enable "Add Python to PATH".
+
+2. Processed CSV files in:
+   - cleaner/processed_.csv_file/
+
+Expected file names look like:
+   - PUB_Demand_2020.P.csv
+   - PUB_Demand_2021.P.csv
+   - PUB_Demand_2022.P.csv
+   - PUB_Demand_2023.P.csv
+   - PUB_Demand_2024.P.csv
+   - PUB_Demand_2025.P.csv
 
 -----------------------------
 STEP 1: INITIAL SETUP
 -----------------------------
-1. Double-click setup_env.bat in the project folder.
-   - This will:
-     - Allow scripts to run on Windows
-     - Create a folder named venv (your Python environment)
-     - Install all required packages (FastAPI, Streamlit, Pandas, etc.)
-2. Wait until the window indicates setup is complete.
-3. You should now see a new folder named "venv" in your project directory.
+Double-click:
+
+   setup_env.bat
+
+This creates the local Python environment in venv and installs packages from:
+
+   requirements.txt
+
+Main packages include FastAPI, Streamlit, Pandas, Plotly, Prophet, LightGBM,
+holidays, and joblib.
 
 -----------------------------
-STEP 2: DATA CHECK
+STEP 2: CURRENT TRAIN/TEST PLAN
 -----------------------------
-1. Make sure your processed CSV file is present at:
-   - cleaner/processed_.csv_file/PUB_Demand_YYYY.P.csv (where YYYY is the year)
-2. If you have multiple years, you can have several files (e.g., PUB_Demand_2023.P.csv).
+The current database is prepared for this workflow:
+
+   Train forecast models with: 2020-2024 data
+   Test outcomes with:        2025 data
+
+
+Keep 2025 out of the database until after the server has trained forecasts from
+the 2020-2024 data.
 
 -----------------------------
-SENDER MODE: BULK OR REALTIME
+STEP 3: START LAPTOP 1
 -----------------------------
-The sender behavior is controlled in the .env file:
+Double-click:
+
+   start_laptop1.bat
+
+This starts:
+   - FastAPI server: server/app.py
+   - Sender script:  client/sender.py
+
+FastAPI endpoints used by the dashboard include:
+   - /dashboard/data
+   - /forecast/latest
+   - /forecast/refresh
+   - /records/count
+
+-----------------------------
+STEP 4: VIEW THE DASHBOARD
+-----------------------------
+On the same laptop, or another laptop on the same network, run:
+
+   dashboard/start_laptop2.bat
+
+The Streamlit dashboard opens at:
+
+   http://localhost:8501
+
+If it does not open automatically, copy the URL from the terminal into your
+browser.
+
+-----------------------------
+FORECASTING NOTES
+-----------------------------
+Forecast training happens on the server, not in the dashboard.
+
+The server uses:
+   - Prophet
+   - LightGBM direct multi-step models
+   - server/features.py for feature engineering
+
+LightGBM model files are cached in:
+
+   models/
+
+This folder is ignored by Git. If you delete it, the server will retrain models
+the next time forecasts are refreshed.
+
+The forecast ensemble currently uses:
+
+   5% Prophet + 95% LightGBM
+
+-----------------------------
+HOW TO TEST WITH 2025 DATA
+-----------------------------
+1. Start the server with only 2020-2024 data in data.db.
+2. Open the dashboard and refresh/trigger forecasts.
+3. Wait for forecast training to finish.
+4. Ingest the 2025 file afterward:
+
+   cleaner/processed_.csv_file/PUB_Demand_2025.P.csv
+
+5. Use the dashboard to compare forecasted values against the 2025 actual rows.
+
+If 2025 was already sent by mistake, remove it from data.db and clear forecast
+cache before training again.
+
+-----------------------------
+SENDER MODE
+-----------------------------
+The sender mode is controlled in .env:
 
    CLIENT_SEND_MODE=bulk
 
-Current config lines:
-   - .env line 9: CLIENT_SEND_MODE=bulk ; =realtime, for live-style behavior
-   - .env line 10: CLIENT_BULK_CHUNK_SIZE=1000 ; The number of rows sent per request
-   - .env line 11: CLIENT_REALTIME_DELAY_SECONDS=30 ; wait time between rows
-   - .env line 12: MAX_BULK_INGEST_ROWS=5000
+Common options:
+   - bulk: sends rows quickly in chunks
+   - realtime: sends one row at a time with a delay
 
-Use bulk mode when you want to load historical data quickly for forecasting.
-In bulk mode, client/sender.py sends many rows at once to the server using:
-
-   /ingest/bulk
-
-Related code lines:
-   - client/sender.py line 28: BULK_API_URL points to /ingest/bulk
-   - client/sender.py line 35: reads CLIENT_SEND_MODE
-   - client/sender.py line 36: reads CLIENT_BULK_CHUNK_SIZE
-   - client/sender.py line 218: send_dataframe_bulk sends chunks of rows
-   - client/sender.py line 308: bulk mode calls send_dataframe_bulk
-   - server/app.py line 577: defines the /ingest/bulk endpoint
-   - server/app.py line 98: reads MAX_BULK_INGEST_ROWS
-
-Related code lines:
-   - client/sender.py line 37: reads CLIENT_REALTIME_DELAY_SECONDS
-   - client/sender.py line 227: send_dataframe_realtime sends one row at a time
-   - client/sender.py line 306: realtime mode calls send_dataframe_realtime
-
-So with CLIENT_SEND_MODE=realtime and CLIENT_REALTIME_DELAY_SECONDS=30, the sender
-will send one row every 30 seconds.
-
------------------------------
-STEP 3: START THE SYSTEM (LAPTOP 1)
------------------------------
-1. Double-click start_laptop1.bat
-   - This will start:
-     - The FastAPI Server (server/app.py)
-     - The Sender Script (client/sender.py)
-2. Wait for the terminal to show messages like "Uvicorn running..." and "Sender started..."
-
------------------------------
-STEP 4: VIEW THE DASHBOARD (LAPTOP 1 or 2)
------------------------------
-1. On the same laptop or a different one on the same network:
-   - Double-click start_laptop2.bat
-   - This will open the dashboard in your web browser (Streamlit UI)
-2. If it does not open automatically, look for a link like http://localhost:8501 in the terminal and open it in your browser.
+Useful .env settings:
+   - CLIENT_BULK_CHUNK_SIZE
+   - CLIENT_REALTIME_DELAY_SECONDS
+   - MAX_BULK_INGEST_ROWS
 
 -----------------------------
 RUNNING ON TWO LAPTOPS
 -----------------------------
-If you want to view the dashboard from a different laptop:
-1. Find the local IP address of Laptop 1 (the server):
-   - Open Command Prompt and type: ipconfig
-   - Look for the "IPv4 Address" (e.g., 192.168.1.10)
-2. On Laptop 2, open the file dashboard/dashboard.py and set:
-   - SERVER_IP = "Laptop 1's IP address"
-3. Save the file and run start_laptop2.bat on Laptop 2.
+If the dashboard runs on Laptop 2 and the server runs on Laptop 1:
+
+1. On Laptop 1, find the IPv4 address:
+
+   ipconfig
+
+2. On Laptop 2, set SERVER_IP for the dashboard.
+   The dashboard reads:
+
+   SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
+
+You can set SERVER_IP in the environment before starting Streamlit, or edit the
+startup script to set it.
 
 -----------------------------
 TROUBLESHOOTING
 -----------------------------
-- Sender says 'FileNotFound':
-  - Check that the CSV filename matches the one set in client/sender.py.
-- Dashboard says 'Waiting for data from the server...':
-  - Make sure the server is running (see Step 3)
-  - Check for errors in the terminal window
-- Connection errors:
-  - If running on two laptops, make sure both are on the same network
-  - Double-check the SERVER_IP setting
-- Port already in use:
-  - Another program may be using the same port. Restart your computer or change the port in the code (advanced users).
-- Still stuck?
-  - Try restarting both the server and the dashboard
-  - Check the main project README or ask for help
+- Dashboard says "Waiting for data from the server..."
+  - Make sure FastAPI is running.
+  - Check that data.db has rows.
+  - Check the terminal for server errors.
 
------------------------------
-WHERE TO GET HELP
------------------------------
-- Read the full user guide: dashboard/README_Dashboard.md
+- Forecast stays empty
+  - Make sure at least 500 training rows exist.
+  - Check that LightGBM is installed.
+  - Delete models/ and refresh forecasts to retrain.
+
+- 2025 appears before testing
+  - Delete 2025 rows from data.db.
+  - Clear forecast_cache.
+  - Remove PUB_Demand_2025.P.csv from sent_files.txt.
+
+- Port already in use
+  - Close old server/dashboard windows or restart the computer.
 
 -----------------------------
 END OF GUIDE
 -----------------------------
-
