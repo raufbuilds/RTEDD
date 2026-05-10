@@ -212,7 +212,109 @@ def demand_dataframe():
     df = df[(df["Hour"] >= 0) & (df["Hour"] <= 23)]
     df = df.sort_values(["Date", "Hour", "id"]).reset_index(drop=True)
     df["Timestamp"] = df["Date"] + pd.to_timedelta(df["Hour"], unit="h")
+    df["Date Label"] = df["Date"].dt.strftime("%Y-%m-%d")
     return df
+
+
+def calculate_anomalies(df):
+    if df.empty:
+        return df
+
+    df = df.copy()
+    hour_median = df.groupby("Hour")["Ontario Demand"].transform("median")
+    hour_mad = df.groupby("Hour")["Ontario Demand"].transform(
+        lambda series: (series - series.median()).abs().median()
+    )
+
+    global_mad = (df["Ontario Demand"] - df["Ontario Demand"].median()).abs().median()
+    global_std = df["Ontario Demand"].std()
+    fallback_scale = max(
+        [value for value in [global_mad * 1.4826, global_std] if pd.notna(value) and value > 0]
+        or [1.0]
+    )
+
+    scale = hour_mad.fillna(fallback_scale) * 1.4826
+    scale = scale.replace(0, fallback_scale)
+
+    df["Expected Demand"] = hour_median
+    df["Deviation"] = df["Ontario Demand"] - df["Expected Demand"]
+    df["Anomaly Score"] = (df["Deviation"].abs() / scale).fillna(0)
+    df["Anomaly"] = df["Anomaly Score"] >= 3
+    df["Status"] = df["Anomaly"].map(lambda value: "Anomaly detected" if value else "System normal")
+    return df
+
+
+def compute_hourly_baseline(df, threshold=3.0, target_date=None, min_points_per_hour=2):
+    if df.empty:
+        return pd.DataFrame(columns=["Hour", "Expected", "Scale", "Lower", "Upper"])
+
+    baseline_source = df.copy()
+    baseline_source["Date"] = pd.to_datetime(baseline_source["Date"], errors="coerce")
+    baseline_source["Hour"] = pd.to_numeric(baseline_source["Hour"], errors="coerce")
+    baseline_source["Ontario Demand"] = pd.to_numeric(
+        baseline_source["Ontario Demand"],
+        errors="coerce",
+    )
+    baseline_source = baseline_source.dropna(subset=["Date", "Hour", "Ontario Demand"])
+    if baseline_source.empty:
+        return pd.DataFrame(columns=["Hour", "Expected", "Scale", "Lower", "Upper"])
+
+    baseline_source["Hour"] = baseline_source["Hour"].astype(int)
+    baseline_source = baseline_source[(baseline_source["Hour"] >= 0) & (baseline_source["Hour"] <= 23)]
+    if baseline_source.empty:
+        return pd.DataFrame(columns=["Hour", "Expected", "Scale", "Lower", "Upper"])
+
+    if target_date is None:
+        target_date = baseline_source["Date"].max()
+    target_month = pd.Timestamp(target_date).month
+    target_quarter = pd.Timestamp(target_date).quarter
+
+    same_month = baseline_source[baseline_source["Date"].dt.month == target_month]
+    same_quarter = baseline_source[baseline_source["Date"].dt.quarter == target_quarter]
+
+    monthly_counts = same_month.groupby("Hour")["Ontario Demand"].size()
+    enough_monthly_hours = (monthly_counts >= min_points_per_hour).sum()
+    if enough_monthly_hours >= 18:
+        seasonal_source = same_month
+    elif not same_quarter.empty:
+        seasonal_source = same_quarter
+    else:
+        seasonal_source = baseline_source
+
+    def mad(series: pd.Series) -> float:
+        med = series.median()
+        return float((series - med).abs().median())
+
+    global_median = baseline_source["Ontario Demand"].median()
+    global_mad = float((baseline_source["Ontario Demand"] - global_median).abs().median())
+    global_std = baseline_source["Ontario Demand"].std()
+    global_std = float(global_std) if pd.notna(global_std) else 0.0
+    fallback_scale = max([v for v in [global_mad * 1.4826, global_std] if v and v > 0] or [1.0])
+
+    seasonal_expected = seasonal_source.groupby("Hour")["Ontario Demand"].median()
+    seasonal_mad = seasonal_source.groupby("Hour")["Ontario Demand"].apply(mad) * 1.4826
+    all_hour_expected = baseline_source.groupby("Hour")["Ontario Demand"].median()
+    all_hour_mad = baseline_source.groupby("Hour")["Ontario Demand"].apply(mad) * 1.4826
+
+    available_hours = sorted(set(all_hour_expected.index).union(set(seasonal_expected.index)))
+    expected = seasonal_expected.reindex(available_hours).combine_first(
+        all_hour_expected.reindex(available_hours)
+    )
+    scale = seasonal_mad.reindex(available_hours).combine_first(
+        all_hour_mad.reindex(available_hours)
+    )
+    scale = scale.replace(0, fallback_scale).fillna(fallback_scale)
+
+    baseline = pd.DataFrame(
+        {
+            "Hour": expected.index.astype(int),
+            "Expected": expected.values.astype(float),
+            "Scale": scale.values.astype(float),
+        }
+    )
+    baseline["Lower"] = baseline["Expected"] - threshold * baseline["Scale"]
+    baseline["Upper"] = baseline["Expected"] + threshold * baseline["Scale"]
+    return baseline
 
 
 def forecast_training_frame(df, target_date=None, include_target_date=False):
@@ -287,83 +389,66 @@ def forecast_with_prophet(df, target_date=None):
 
 
 def forecast_with_xgboost(df, target_date=None):
-    if df.empty or len(df) < 48:
+    import os
+
+    import joblib
+    try:
+        import lightgbm as lgb
+    except ImportError:
         return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
+    from features import engineer_features, get_feature_cols
 
-    from xgboost import XGBRegressor
+    columns = ["Hour", "XGBoost Predicted"]
+    MODEL_DIR = "models"
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
-    df_features = df.copy()
-    df_features = df_features.dropna(subset=["Timestamp", "Ontario Demand"])
+    if len(df) < 500:
+        return pd.DataFrame(columns=columns)
 
-    if len(df_features) < 48:
-        return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
+    df_feat = engineer_features(df)
+    feature_cols = get_feature_cols(df_feat)
 
-    df_features["hour"] = df_features["Timestamp"].dt.hour
-    df_features["day_of_week"] = df_features["Timestamp"].dt.dayofweek
-    df_features["day_of_month"] = df_features["Timestamp"].dt.day
-    df_features["month"] = df_features["Timestamp"].dt.month
-    df_features["is_weekend"] = (df_features["day_of_week"] >= 5).astype(int)
-
-    df_features = df_features.sort_values("Timestamp")
-    df_features["demand_lag_1"] = df_features["Ontario Demand"].shift(1)
-    df_features["demand_lag_24"] = df_features["Ontario Demand"].shift(24)
-    df_features["rolling_mean_24"] = df_features["Ontario Demand"].rolling(24).mean()
-    df_features["rolling_std_24"] = df_features["Ontario Demand"].rolling(24).std()
-    df_features = df_features.dropna()
-
-    if len(df_features) < 24:
-        return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
-
-    feature_cols = [
-        "hour",
-        "day_of_week",
-        "day_of_month",
-        "month",
-        "is_weekend",
-        "demand_lag_1",
-        "demand_lag_24",
-        "rolling_mean_24",
-        "rolling_std_24",
-    ]
-
-    model = XGBRegressor(
-        n_estimators=100,
-        max_depth=6,
-        learning_rate=0.1,
-        random_state=42,
-        n_jobs=FORECAST_XGBOOST_N_JOBS,
-    )
-    model.fit(df_features[feature_cols], df_features["Ontario Demand"])
-
-    if target_date is None:
-        target_date = df["Date"].max()
-
-    target_ts = pd.Timestamp(target_date)
     predictions = []
-    for hour in range(24):
-        predictions.append(
-            {
-                "hour": hour,
-                "day_of_week": target_ts.dayofweek,
-                "day_of_month": target_ts.day,
-                "month": target_ts.month,
-                "is_weekend": 1 if target_ts.dayofweek >= 5 else 0,
-                "demand_lag_1": df_features["Ontario Demand"].iloc[-1],
-                "demand_lag_24": (
-                    df_features[df_features["Timestamp"] < target_ts - pd.Timedelta(hours=24)][
-                        "Ontario Demand"
-                    ].mean()
-                    if len(df_features) > 24
-                    else 0
-                ),
-                "rolling_mean_24": df_features["Ontario Demand"].tail(24).mean(),
-                "rolling_std_24": df_features["Ontario Demand"].tail(24).std(),
-            }
-        )
+    for h in range(24):
+        train = df_feat.copy()
+        train["target"] = train["Ontario Demand"].shift(-h)
+        train = train.dropna(subset=["target"])
+        current_train_rows = len(train)
+        if current_train_rows < 200:
+            continue
 
-    pred_df = pd.DataFrame(predictions)[feature_cols]
-    forecasted = model.predict(pred_df)
-    return pd.DataFrame({"Hour": range(24), "XGBoost Predicted": forecasted})
+        model_path = os.path.join(MODEL_DIR, f"lgb_h{h}.pkl")
+        model = None
+        retrain = True
+
+        if os.path.exists(model_path):
+            model = joblib.load(model_path)
+            train_rows = getattr(model, "_train_rows", None)
+            if train_rows is not None and (current_train_rows - model._train_rows) < 168:
+                retrain = False
+
+        if model is None or retrain:
+            model = lgb.LGBMRegressor(
+                n_estimators=500,
+                max_depth=8,
+                learning_rate=0.04,
+                num_leaves=64,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.05,
+                reg_lambda=0.05,
+                random_state=42,
+                n_jobs=-1,
+                verbose=-1,
+            )
+            model.fit(train[feature_cols], train["target"])
+            model._train_rows = len(train)
+            joblib.dump(model, model_path)
+
+        pred = model.predict(df_feat.iloc[[-1]][feature_cols])[0]
+        predictions.append({"Hour": h, "XGBoost Predicted": pred})
+
+    return pd.DataFrame(predictions, columns=columns)
 
 
 def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
@@ -384,7 +469,7 @@ def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
         result["XGBoost"] = result["Ensemble"]
     else:
         merged = pd.merge(prophet_forecast, xgboost_forecast, on="Hour", how="outer")
-        merged["Ensemble"] = 0.4 * merged["Prophet Predicted"] + 0.6 * merged["XGBoost Predicted"]
+        merged["Ensemble"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged["XGBoost Predicted"]
         result = merged.rename(
             columns={
                 "Prophet Predicted": "Prophet",
@@ -657,6 +742,27 @@ async def records(
 @app.get("/records/count")
 async def records_count():
     return {"total_records": fetch_record_count()}
+
+
+@app.get("/dashboard/data")
+async def dashboard_data():
+    df = demand_dataframe()
+    total_records = len(df)
+    if df.empty:
+        return {"records": [], "baseline": [], "total_records": total_records}
+
+    df = calculate_anomalies(df)
+    baseline = compute_hourly_baseline(df)
+
+    records_df = df.copy()
+    records_df["Date"] = records_df["Date"].dt.strftime("%Y-%m-%d")
+    records_df["Timestamp"] = records_df["Timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    return {
+        "records": records_df.to_dict(orient="records"),
+        "baseline": baseline.to_dict(orient="records"),
+        "total_records": total_records,
+    }
 
 
 @app.get("/latest")
