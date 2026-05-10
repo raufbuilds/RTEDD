@@ -1,8 +1,5 @@
-import json
 import os
-import threading
 import time
-from queue import Empty, Full, Queue
 from typing import Any
 
 import pandas as pd
@@ -14,12 +11,10 @@ import streamlit as st
 
 SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
 BASE_URL = f"http://{SERVER_IP}:8000"
-STREAM_URL = f"{BASE_URL}/stream"
-RECORDS_URL = f"{BASE_URL}/records"
 RECORD_COUNT_URL = f"{BASE_URL}/records/count"
+DASHBOARD_DATA_URL = f"{BASE_URL}/dashboard/data"
 FORECAST_URL = f"{BASE_URL}/forecast/latest"
 FORECAST_REFRESH_URL = f"{BASE_URL}/forecast/refresh"
-MAX_BUFFER_SIZE = 20000
 HOURS = list(range(24))
 FORECAST_POLL_SECONDS = 15
 FORECAST_FRESH_POLL_SECONDS = 60
@@ -53,16 +48,10 @@ st.caption(f"Connected to {BASE_URL}")
 
 
 def ensure_state():
-    if "records" not in st.session_state:
-        st.session_state.records = []
-    if "record_ids" not in st.session_state:
-        st.session_state.record_ids = set()
-    if "data_queue" not in st.session_state:
-        st.session_state.data_queue = Queue(maxsize=MAX_BUFFER_SIZE)
-    if "stream_thread" not in st.session_state:
-        st.session_state.stream_thread = None
-    if "history_loaded" not in st.session_state:
-        st.session_state.history_loaded = False
+    if "dashboard_df" not in st.session_state:
+        st.session_state.dashboard_df = pd.DataFrame()
+    if "dashboard_baseline" not in st.session_state:
+        st.session_state.dashboard_baseline = pd.DataFrame()
     if "last_error" not in st.session_state:
         st.session_state.last_error = None
     if "selected_anomaly_id" not in st.session_state:
@@ -140,83 +129,6 @@ def clamp_date_range(date_range, min_date, max_date):
     return (start, end)
 
 
-def normalize_record(raw):
-    if not isinstance(raw, dict):
-        return None
-
-    record_id = raw.get("id")
-    date_value = raw.get("Date", raw.get("date"))
-    hour_value = raw.get("Hour", raw.get("hour"))
-    demand_value = raw.get("Ontario Demand", raw.get("demand"))
-
-    if date_value is None or hour_value is None or demand_value is None:
-        return None
-
-    date_value = pd.to_datetime(date_value, errors="coerce")
-    hour_value = pd.to_numeric(hour_value, errors="coerce")
-    demand_value = pd.to_numeric(demand_value, errors="coerce")
-
-    if pd.isna(date_value) or pd.isna(hour_value) or pd.isna(demand_value):
-        return None
-
-    hour_value = int(hour_value)
-    if hour_value < 0 or hour_value > 23:
-        return None
-
-    if record_id is None:
-        record_id = f"{date_value.date()}-{hour_value}-{float(demand_value)}"
-
-    return {
-        "id": record_id,
-        "Date": date_value.normalize(),
-        "Hour": hour_value,
-        "Ontario Demand": float(demand_value),
-    }
-
-
-def add_record(raw_record):
-    record = normalize_record(raw_record)
-    if record is None:
-        return False
-
-    record_id = record["id"]
-    if record_id in st.session_state.record_ids:
-        return False
-
-    st.session_state.records.append(record)
-    st.session_state.record_ids.add(record_id)
-
-    overflow = len(st.session_state.records) - MAX_BUFFER_SIZE
-    if overflow > 0:
-        removed = st.session_state.records[:overflow]
-        st.session_state.records = st.session_state.records[overflow:]
-        for item in removed:
-            st.session_state.record_ids.discard(item["id"])
-
-    return True
-
-
-def load_history():
-    try:
-        response = requests.get(RECORDS_URL, timeout=20)
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        st.session_state.last_error = f"History load failed: {exc}"
-        return
-
-    loaded = 0
-    if isinstance(payload, list):
-        for raw in payload:
-            if add_record(raw):
-                loaded += 1
-
-    st.session_state.history_loaded = True
-    if loaded:
-        st.session_state.last_error = None
-    fetch_total_records_received(force=True)
-
-
 def fetch_total_records_received(force=False):
     now = time.time()
     if not force and now - st.session_state.last_record_count_fetch < 5:
@@ -227,12 +139,73 @@ def fetch_total_records_received(force=False):
         response.raise_for_status()
         payload = response.json()
     except requests.RequestException:
-        return max(st.session_state.total_records_received, len(st.session_state.records))
+        return max(st.session_state.total_records_received, len(st.session_state.dashboard_df))
 
     total_records = int(payload.get("total_records", 0))
     st.session_state.total_records_received = total_records
     st.session_state.last_record_count_fetch = now
     return total_records
+
+
+def fetch_dashboard_data():
+    try:
+        response = requests.get(DASHBOARD_DATA_URL, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        st.session_state.last_error = f"Dashboard data load failed: {exc}"
+        return (
+            st.session_state.dashboard_df.copy(),
+            st.session_state.dashboard_baseline.copy(),
+            st.session_state.total_records_received,
+        )
+
+    records = payload.get("records") or []
+    baseline_rows = payload.get("baseline") or []
+    total_records = int(payload.get("total_records", len(records)))
+
+    df = pd.DataFrame(records)
+    if not df.empty:
+        for column in ["Date", "Timestamp"]:
+            if column in df.columns:
+                df[column] = pd.to_datetime(df[column], errors="coerce")
+        numeric_cols = [
+            "id",
+            "Hour",
+            "Ontario Demand",
+            "Expected Demand",
+            "Deviation",
+            "Anomaly Score",
+        ]
+        for column in numeric_cols:
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce")
+        if "Anomaly" in df.columns:
+            df["Anomaly"] = df["Anomaly"].astype(bool)
+        df = df.dropna(subset=["Date", "Hour", "Ontario Demand", "Timestamp"])
+        df["Hour"] = df["Hour"].astype(int)
+        if "Date Label" not in df.columns:
+            df["Date Label"] = df["Date"].dt.strftime("%Y-%m-%d")
+
+    baseline = pd.DataFrame(baseline_rows)
+    if not baseline.empty:
+        for column in ["Hour", "Expected", "Scale", "Lower", "Upper"]:
+            if column in baseline.columns:
+                baseline[column] = pd.to_numeric(baseline[column], errors="coerce")
+        baseline = baseline.dropna(subset=["Hour", "Expected", "Lower", "Upper"])
+        baseline["Hour"] = baseline["Hour"].astype(int)
+
+    st.session_state.dashboard_df = df
+    st.session_state.dashboard_baseline = baseline
+    st.session_state.total_records_received = total_records
+    st.session_state.last_received_epoch = time.time()
+    st.session_state.last_received_record = (
+        df.sort_values(["Date", "Hour", "id"]).tail(1).to_dict(orient="records")[0]
+        if not df.empty
+        else None
+    )
+    st.session_state.last_error = None
+    return df.copy(), baseline.copy(), total_records
 
 
 def request_forecast_refresh(target_date=None, include_target_date=False):
@@ -347,134 +320,6 @@ def forecast_status_text():
         parts.append(message)
 
     return " | ".join(parts)
-
-
-def enqueue_latest(data_queue, record):
-    try:
-        data_queue.put_nowait(record)
-    except Full:
-        try:
-            data_queue.get_nowait()
-        except Empty:
-            pass
-        try:
-            data_queue.put_nowait(record)
-        except Full:
-            pass
-
-
-def stream_worker(data_queue):
-    backoff = 2
-
-    while True:
-        try:
-            with requests.get(STREAM_URL, stream=True, timeout=(5, 30)) as response:
-                response.raise_for_status()
-                backoff = 2
-
-                for line in response.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
-                    if line.startswith("data:"):
-                        payload = line.replace("data:", "", 1).strip()
-                        try:
-                            record = json.loads(payload)
-                            enqueue_latest(data_queue, record)
-                        except json.JSONDecodeError:
-                            continue
-
-        except requests.RequestException as exc:
-            st.session_state.last_error = f"Stream error: {exc}"
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-
-
-def drain_queue():
-    changed = False
-    while True:
-        try:
-            raw = st.session_state.data_queue.get_nowait()
-        except Empty:
-            break
-        if add_record(raw):
-            changed = True
-            st.session_state.last_received_epoch = time.time()
-            st.session_state.last_received_record = raw
-    return changed
-
-
-def dataframe_from_state():
-    if not st.session_state.records:
-        return pd.DataFrame(columns=["id", "Date", "Hour", "Ontario Demand"])
-
-    df = pd.DataFrame(st.session_state.records).copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Hour"] = pd.to_numeric(df["Hour"], errors="coerce")
-    df["Ontario Demand"] = pd.to_numeric(df["Ontario Demand"], errors="coerce")
-    df = df.dropna(subset=["Date", "Hour", "Ontario Demand"])
-    df["Hour"] = df["Hour"].astype(int)
-    df = df.sort_values(["Date", "Hour", "id"]).reset_index(drop=True)
-    df["Timestamp"] = df["Date"] + pd.to_timedelta(df["Hour"], unit="h")
-    df["Date Label"] = df["Date"].dt.strftime("%Y-%m-%d")
-    return df
-
-
-def calculate_anomalies(df):
-    if df.empty:
-        return df
-
-    df = df.copy()
-    hour_median = df.groupby("Hour")["Ontario Demand"].transform("median")
-    hour_mad = df.groupby("Hour")["Ontario Demand"].transform(
-        lambda series: (series - series.median()).abs().median()
-    )
-
-    global_mad = (df["Ontario Demand"] - df["Ontario Demand"].median()).abs().median()
-    global_std = df["Ontario Demand"].std()
-    fallback_scale = max(
-        [value for value in [global_mad * 1.4826, global_std] if pd.notna(value) and value > 0]
-        or [1.0]
-    )
-
-    scale = hour_mad.fillna(fallback_scale) * 1.4826
-    scale = scale.replace(0, fallback_scale)
-
-    df["Expected Demand"] = hour_median
-    df["Deviation"] = df["Ontario Demand"] - df["Expected Demand"]
-    df["Anomaly Score"] = (df["Deviation"].abs() / scale).fillna(0)
-    df["Anomaly"] = df["Anomaly Score"] >= 3
-    df["Status"] = df["Anomaly"].map(lambda value: "Anomaly detected" if value else "System normal")
-    return df
-
-
-def compute_hourly_baseline(df, threshold=3.0):
-    if df.empty:
-        return pd.DataFrame(columns=["Hour", "Expected", "Scale", "Lower", "Upper"])
-
-    expected = df.groupby("Hour")["Ontario Demand"].median()
-
-    def mad(series: pd.Series) -> float:
-        med = series.median()
-        return float((series - med).abs().median())
-
-    hour_mad = df.groupby("Hour")["Ontario Demand"].apply(mad)
-
-    global_mad = float((df["Ontario Demand"] - df["Ontario Demand"].median()).abs().median())
-    global_std = float(df["Ontario Demand"].std()) if pd.notna(df["Ontario Demand"].std()) else 0.0
-    fallback_scale = max([v for v in [global_mad * 1.4826, global_std] if v and v > 0] or [1.0])
-
-    scale = (hour_mad * 1.4826).replace(0, fallback_scale).fillna(fallback_scale)
-
-    baseline = pd.DataFrame(
-        {
-            "Hour": expected.index.astype(int),
-            "Expected": expected.values.astype(float),
-            "Scale": scale.reindex(expected.index).values.astype(float),
-        }
-    )
-    baseline["Lower"] = baseline["Expected"] - threshold * baseline["Scale"]
-    baseline["Upper"] = baseline["Expected"] + threshold * baseline["Scale"]
-    return baseline
 
 
 def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
@@ -626,10 +471,8 @@ def sidebar_controls(df):
     hour_range = st.sidebar.slider("Hour range", 0, 23, key="hour_range")
     show_normal_rows = st.sidebar.checkbox("Show normal rows", key="show_normal_rows")
 
-    st.sidebar.caption(f"History buffer: {len(st.session_state.records)} records")
-    st.sidebar.caption(
-        f"Connection: {'Streaming' if st.session_state.stream_thread and st.session_state.stream_thread.is_alive() else 'Starting'}"
-    )
+    st.sidebar.caption(f"Loaded records: {len(df)}")
+    st.sidebar.caption("Connection: Server-backed")
 
     if st.session_state.last_error:
         st.sidebar.warning(st.session_state.last_error)
@@ -1020,9 +863,7 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
     if not forecast_df.empty:
         merged = pd.merge(merged, forecast_df, on="Hour", how="outer")
 
-    baseline_df = compute_hourly_baseline(comparison_source)
-    if baseline_df.empty and baseline is not None:
-        baseline_df = baseline
+    baseline_df = baseline if baseline is not None else pd.DataFrame()
     if not baseline_df.empty:
         expected_median = baseline_df[["Hour", "Expected"]].rename(
             columns={"Expected": "Expected Median"}
@@ -1228,20 +1069,12 @@ def render_chart(df, view_mode, baseline, scope_label):
 
 
 def render_dashboard_content(view, scope, date_range, hour_range, show_normal_rows):
-    queue_changed = drain_queue()
-    total_records_received = fetch_total_records_received(force=queue_changed)
-    df = dataframe_from_state()
-    if not df.empty:
-        df = calculate_anomalies(df)
-
-    if queue_changed:
-        st.session_state.last_error = None
+    df, baseline, total_records_received = fetch_dashboard_data()
 
     if df.empty:
         st.info("Waiting for data from the server...")
         return
 
-    baseline = compute_hourly_baseline(df)
     df_view = apply_scope_and_filters(df, scope, date_range, hour_range)
     scope_label = build_scope_label(df_view, scope, hour_range)
 
@@ -1295,18 +1128,10 @@ def render_dashboard_content(view, scope, date_range, hour_range, show_normal_ro
 
 ensure_state()
 
-if not st.session_state.history_loaded:
-    load_history()
+if st.session_state.dashboard_df.empty:
+    fetch_dashboard_data()
 
-if st.session_state.stream_thread is None or not st.session_state.stream_thread.is_alive():
-    st.session_state.stream_thread = threading.Thread(
-        target=stream_worker,
-        args=(st.session_state.data_queue,),
-        daemon=True,
-    )
-    st.session_state.stream_thread.start()
-
-df_sidebar = dataframe_from_state()
+df_sidebar = st.session_state.dashboard_df.copy()
 (
     view,
     refresh_seconds,
