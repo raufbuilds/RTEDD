@@ -103,6 +103,13 @@ LightGBM model files are cached in:
 This folder is ignored by Git. If you delete it, the server will retrain models
 the next time forecasts are refreshed.
 
+LightGBM retraining is controlled by:
+
+   FORECAST_LIGHTGBM_RETRAIN_ROWS=168
+
+The default 168 means the server reuses cached LightGBM models until at least
+168 new training rows exist. For hourly data, 168 rows is 7 days.
+
 The forecast ensemble currently uses:
 
    5% Prophet + 95% LightGBM
