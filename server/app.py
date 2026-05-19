@@ -6,7 +6,7 @@ from queue import Queue
 import sqlite3
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional, cast
 
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, Query, Request
@@ -98,6 +98,7 @@ MAX_REQUEST_SIZE_BYTES = int(os.getenv("MAX_REQUEST_SIZE_BYTES", str(1024 * 1024
 MAX_BULK_INGEST_ROWS = int(os.getenv("MAX_BULK_INGEST_ROWS", "5000"))
 FORECAST_REFRESH_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))
 FORECAST_XGBOOST_N_JOBS = int(os.getenv("FORECAST_XGBOOST_N_JOBS", "2"))
+FORECAST_LIGHTGBM_RETRAIN_ROWS = int(os.getenv("FORECAST_LIGHTGBM_RETRAIN_ROWS", "168"))
 
 connection_pool = Queue(maxsize=DB_POOL_SIZE)
 forecast_training_lock = threading.Lock()
@@ -388,6 +389,33 @@ def forecast_with_prophet(df, target_date=None):
     )
 
 
+def get_model_metadata_path(model_path):
+    """Get the metadata file path for a model."""
+    return model_path.replace(".pkl", ".meta.json")
+
+
+def load_model_train_rows(model_path):
+    """Load the number of training rows from model metadata."""
+    meta_path = get_model_metadata_path(model_path)
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r") as f:
+                return json.load(f).get("train_rows", None)
+        except Exception:
+            return None
+    return None
+
+
+def save_model_train_rows(model_path, train_rows):
+    """Save the number of training rows to model metadata."""
+    meta_path = get_model_metadata_path(model_path)
+    try:
+        with open(meta_path, "w") as f:
+            json.dump({"train_rows": train_rows}, f)
+    except Exception:
+        pass
+
+
 def forecast_with_xgboost(df, target_date=None):
     import os
 
@@ -396,7 +424,10 @@ def forecast_with_xgboost(df, target_date=None):
         import lightgbm as lgb
     except ImportError:
         return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
-    from features import engineer_features, get_feature_cols
+    try:
+        from server.features import engineer_features, get_feature_cols
+    except ImportError:
+        from features import engineer_features, get_feature_cols
 
     columns = ["Hour", "XGBoost Predicted"]
     MODEL_DIR = "models"
@@ -423,8 +454,11 @@ def forecast_with_xgboost(df, target_date=None):
 
         if os.path.exists(model_path):
             model = joblib.load(model_path)
-            train_rows = getattr(model, "_train_rows", None)
-            if train_rows is not None and (current_train_rows - model._train_rows) < 168:
+            train_rows = load_model_train_rows(model_path)
+            if (
+                train_rows is not None
+                and (current_train_rows - train_rows) < FORECAST_LIGHTGBM_RETRAIN_ROWS
+            ):
                 retrain = False
 
         if model is None or retrain:
@@ -442,10 +476,12 @@ def forecast_with_xgboost(df, target_date=None):
                 verbose=-1,
             )
             model.fit(train[feature_cols], train["target"])
-            model._train_rows = len(train)
             joblib.dump(model, model_path)
+            save_model_train_rows(model_path, len(train))
 
-        pred = model.predict(df_feat.iloc[[-1]][feature_cols])[0]
+        X_pred = df_feat.iloc[-1:][feature_cols]
+        pred_result = cast(Any, model.predict(X_pred))
+        pred = float(pred_result[0])
         predictions.append({"Hour": h, "XGBoost Predicted": pred})
 
     return pd.DataFrame(predictions, columns=columns)
@@ -517,6 +553,63 @@ def get_cached_forecast(cache_key: str):
         "trained_at": row[7],
         "requested_at": row[8],
     }
+
+
+def get_latest_fresh_forecast(include_target_date: bool):
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT cache_key, target_date, include_target_date, signature, result_json, "
+            "status, error, trained_at, requested_at FROM forecast_cache "
+            "WHERE include_target_date = ? AND status = 'fresh' AND result_json IS NOT NULL "
+            "ORDER BY trained_at DESC LIMIT 1",
+            (int(include_target_date),),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "cache_key": row[0],
+        "target_date": row[1],
+        "include_target_date": bool(row[2]),
+        "signature": json.loads(row[3]) if row[3] else None,
+        "forecast": json.loads(row[4]) if row[4] else [],
+        "status": row[5],
+        "error": row[6],
+        "trained_at": row[7],
+        "requested_at": row[8],
+    }
+
+
+def forecast_training_seconds(cached, now=None):
+    if not cached or cached.get("requested_at") is None:
+        return None
+
+    end_time = cached.get("trained_at") if cached.get("status") in {"fresh", "failed", "empty"} else now
+    if end_time is None:
+        end_time = time.time()
+
+    return max(0.0, float(end_time) - float(cached["requested_at"]))
+
+
+def forecast_summary(status, stale=False, error=None, training_seconds=None):
+    if status == "training":
+        if training_seconds is None:
+            return "Training is queued or starting."
+        return f"Training is running for {training_seconds:.0f}s."
+    if status == "stale":
+        return "Showing cached forecast while a refresh is queued."
+    if status == "fresh":
+        return "Forecast is ready and using cached server results."
+    if status == "failed":
+        return f"Training failed: {error}" if error else "Training failed."
+    if status == "empty":
+        return "No forecast is available because there are no demand records."
+    if stale:
+        return "Forecast cache is stale and refresh has been queued."
+    return "Forecast status is pending."
 
 
 def save_forecast_cache(
@@ -794,8 +887,11 @@ async def forecast_latest(
             "include_target_date": include_target_date,
             "forecast": [],
             "trained_at": None,
+            "requested_at": None,
+            "training_seconds": None,
             "stale": False,
             "message": "No demand records are available.",
+            "summary": forecast_summary("empty"),
         }
 
     cache_key = forecast_cache_key(normalized_target_date, include_target_date)
@@ -810,32 +906,71 @@ async def forecast_latest(
     now = time.time()
 
     is_missing = cached is None or not cached.get("forecast")
-    is_stale = (
-        cached is not None
-        and (
-            cached.get("signature") != list(current_signature)
-            or cached.get("trained_at") is None
-            or now - float(cached["trained_at"]) > FORECAST_REFRESH_SECONDS
-        )
+    is_stale = cached is not None and (
+        cached.get("signature") != list(current_signature)
+        or cached.get("trained_at") is None
     )
 
     if is_missing or is_stale or (cached and cached.get("status") == "failed"):
         schedule_forecast_refresh(background_tasks, normalized_target_date, include_target_date)
 
     if cached is None:
+        fallback = get_latest_fresh_forecast(include_target_date)
+        if fallback is not None and fallback.get("forecast"):
+            return {
+                "status": "training",
+                "target_date": normalized_target_date,
+                "include_target_date": include_target_date,
+                "forecast": fallback["forecast"],
+                "trained_at": fallback["trained_at"],
+                "requested_at": None,
+                "training_seconds": None,
+                "stale": True,
+                "error": None,
+                "message": "Forecast training has been queued.",
+                "summary": (
+                    f"Showing last saved forecast for {fallback['target_date']} "
+                    f"while {normalized_target_date} trains."
+                ),
+            }
         return {
             "status": "training",
             "target_date": normalized_target_date,
             "include_target_date": include_target_date,
             "forecast": [],
             "trained_at": None,
+            "requested_at": None,
+            "training_seconds": None,
             "stale": True,
             "message": "Forecast training has been queued.",
+            "summary": "Forecast training has been queued.",
         }
+
+    if is_missing:
+        fallback = get_latest_fresh_forecast(include_target_date)
+        if fallback is not None and fallback.get("forecast"):
+            training_seconds = forecast_training_seconds(cached, now)
+            return {
+                "status": cached["status"],
+                "target_date": normalized_target_date,
+                "include_target_date": include_target_date,
+                "forecast": fallback["forecast"],
+                "trained_at": fallback["trained_at"],
+                "requested_at": cached["requested_at"],
+                "training_seconds": training_seconds,
+                "stale": True,
+                "error": cached["error"],
+                "message": "Forecast refresh has been queued.",
+                "summary": (
+                    f"Showing last saved forecast for {fallback['target_date']} "
+                    f"while {normalized_target_date} trains."
+                ),
+            }
 
     status = cached["status"]
     if is_stale and status == "fresh":
         status = "stale"
+    training_seconds = forecast_training_seconds(cached, now)
 
     return {
         "status": status,
@@ -843,9 +978,17 @@ async def forecast_latest(
         "include_target_date": include_target_date,
         "forecast": cached["forecast"],
         "trained_at": cached["trained_at"],
+        "requested_at": cached["requested_at"],
+        "training_seconds": training_seconds,
         "stale": is_stale,
         "error": cached["error"],
         "message": "Forecast refresh has been queued." if is_stale else None,
+        "summary": forecast_summary(
+            status,
+            stale=is_stale,
+            error=cached["error"],
+            training_seconds=training_seconds,
+        ),
     }
 
 
