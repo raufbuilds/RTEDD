@@ -1,9 +1,9 @@
-import holidays
+from holidays import country_holidays
 import numpy as np
 import pandas as pd
 
 
-ONTARIO_HOLIDAYS = holidays.CA(prov="ON", years=range(2020, 2026))
+ONTARIO_HOLIDAYS = country_holidays("CA", subdiv="ON", years=range(2020, 2026))
 
 
 def _days_to_nearest_holiday(date_value):
