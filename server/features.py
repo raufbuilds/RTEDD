@@ -72,6 +72,26 @@ def engineer_features(df):
     df["days_to_nearest_holiday"] = dates.map(_days_to_nearest_holiday)
     df["is_dst"] = dates.isin(ONTARIO_DST_TRANSITIONS).astype(int)
 
+    weather_defaults = {
+        "temp": 18.0,
+        "humidity": 50.0,
+        "wind": 0.0,
+        "solar": 0.0,
+    }
+    for column, default in weather_defaults.items():
+        if column not in df.columns:
+            df[column] = default
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(default)
+
+    df["temp_squared"] = df["temp"] ** 2
+    df["temp_lag_1"] = df["temp"].shift(1)
+    df["temp_lag_24"] = df["temp"].shift(24)
+    df["humidity"] = df["humidity"]
+    df["wind_speed"] = df["wind"]
+    df["solar_radiation"] = df["solar"]
+    df["cdd"] = (df["temp"] - 18).clip(lower=0)
+    df["hdd"] = (18 - df["temp"]).clip(lower=0)
+
     for lag in [1, 2, 3, 6, 12, 24, 48, 72, 168]:
         df[f"lag_{lag}"] = demand.shift(lag)
 
@@ -107,6 +127,11 @@ def engineer_features(df):
         lambda series: series.rolling(8, min_periods=1).median()
     )
     df["demand_vs_dow"] = demand - df["expected_dow"]
+
+    for column in ["prophet_trend", "prophet_yearly", "prophet_weekly", "prophet_daily"]:
+        if column not in df.columns:
+            df[column] = 0.0
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
 
     return df.dropna()
 
