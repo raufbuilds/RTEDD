@@ -22,6 +22,9 @@ if exist "%~dp0venv\Scripts\activate.bat" (
     call "%~dp0venv\Scripts\activate.bat"
     pip install --upgrade pip
     pip install -r "%~dp0requirements.txt"
+    
+    echo Loading environment variables from .env...
+    powershell -Command "& '%~dp0load-env.ps1'"
 ) else (
     echo [ERROR] Activation script not found in venv.
     echo This usually means the virtual environment is corrupted or still in use.
