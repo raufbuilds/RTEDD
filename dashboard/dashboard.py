@@ -248,7 +248,17 @@ def forecast_client_cache_key(target_date=None, include_target_date=False):
 
 
 def empty_forecast_frame():
-    return pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"])
+    return pd.DataFrame(
+        columns=[
+            "Hour",
+            "Prophet",
+            "XGBoost",
+            "Ensemble",
+            "Ensemble_P10",
+            "Ensemble_P50",
+            "Ensemble_P90",
+        ]
+    )
 
 
 def forecast_frame_from_rows(forecast_rows):
@@ -256,14 +266,23 @@ def forecast_frame_from_rows(forecast_rows):
         return empty_forecast_frame()
 
     forecast_df = pd.DataFrame(forecast_rows)
-    for column in ["Hour", "Prophet", "XGBoost", "Ensemble"]:
+    forecast_columns = [
+        "Hour",
+        "Prophet",
+        "XGBoost",
+        "Ensemble",
+        "Ensemble_P10",
+        "Ensemble_P50",
+        "Ensemble_P90",
+    ]
+    for column in forecast_columns:
         if column not in forecast_df.columns:
             forecast_df[column] = pd.NA
         forecast_df[column] = pd.to_numeric(forecast_df[column], errors="coerce")
 
     forecast_df = forecast_df.dropna(subset=["Hour"])
     forecast_df["Hour"] = forecast_df["Hour"].astype(int)
-    return forecast_df[["Hour", "Prophet", "XGBoost", "Ensemble"]].sort_values("Hour")
+    return forecast_df[forecast_columns].sort_values("Hour")
 
 
 def forecast_poll_interval(status):
