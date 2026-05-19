@@ -85,8 +85,14 @@ def ensure_state():
         st.session_state.forecast_status = None
     if "forecast_trained_at" not in st.session_state:
         st.session_state.forecast_trained_at = None
+    if "forecast_requested_at" not in st.session_state:
+        st.session_state.forecast_requested_at = None
+    if "forecast_training_seconds" not in st.session_state:
+        st.session_state.forecast_training_seconds = None
     if "forecast_message" not in st.session_state:
         st.session_state.forecast_message = None
+    if "forecast_summary" not in st.session_state:
+        st.session_state.forecast_summary = None
     if "forecast_cache" not in st.session_state:
         st.session_state.forecast_cache = {}
     if "total_records_received" not in st.session_state:
@@ -292,7 +298,10 @@ def fetch_cached_forecast(target_date=None, include_target_date=False):
 
     st.session_state.forecast_status = payload.get("status")
     st.session_state.forecast_trained_at = payload.get("trained_at")
+    st.session_state.forecast_requested_at = payload.get("requested_at")
+    st.session_state.forecast_training_seconds = payload.get("training_seconds")
     st.session_state.forecast_message = payload.get("message")
+    st.session_state.forecast_summary = payload.get("summary")
     st.session_state.forecast_cache[cache_key] = {
         "fetched_at": now,
         "status": payload.get("status"),
@@ -308,18 +317,25 @@ def fetch_cached_forecast(target_date=None, include_target_date=False):
 def forecast_status_text():
     status = st.session_state.forecast_status
     trained_at = st.session_state.forecast_trained_at
+    training_seconds = st.session_state.forecast_training_seconds
     message = st.session_state.forecast_message
+    summary = st.session_state.forecast_summary
 
     parts = []
     if status:
         parts.append(f"Forecast status: {status}")
+    if status == "training" and training_seconds is not None:
+        parts.append(f"Training for {float(training_seconds):.0f}s")
     if trained_at:
         trained_time = pd.to_datetime(float(trained_at), unit="s").strftime("%Y-%m-%d %H:%M:%S")
         parts.append(f"last trained {trained_time}")
     if message:
         parts.append(message)
 
-    return " | ".join(parts)
+    status_line = " | ".join(parts)
+    if summary:
+        return f"{status_line}\n{summary}"
+    return status_line
 
 
 def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
