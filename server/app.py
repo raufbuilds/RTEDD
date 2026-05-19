@@ -99,6 +99,8 @@ MAX_BULK_INGEST_ROWS = int(os.getenv("MAX_BULK_INGEST_ROWS", "5000"))
 FORECAST_REFRESH_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))
 FORECAST_XGBOOST_N_JOBS = int(os.getenv("FORECAST_XGBOOST_N_JOBS", "2"))
 FORECAST_LIGHTGBM_RETRAIN_ROWS = int(os.getenv("FORECAST_LIGHTGBM_RETRAIN_ROWS", "168"))
+WEATHER_LATITUDE = float(os.getenv("WEATHER_LATITUDE", "43.6532"))
+WEATHER_LONGITUDE = float(os.getenv("WEATHER_LONGITUDE", "-79.3832"))
 
 connection_pool = Queue(maxsize=DB_POOL_SIZE)
 forecast_training_lock = threading.Lock()
@@ -153,6 +155,11 @@ def init_db():
             "trained_at REAL, "
             "requested_at REAL)"
         )
+        curr.execute(
+            "CREATE TABLE IF NOT EXISTS weather ("
+            "date TEXT, hour INTEGER, temp REAL, humidity REAL, wind REAL, solar REAL, "
+            "PRIMARY KEY(date, hour))"
+        )
         conn.commit()
 
 
@@ -199,6 +206,13 @@ def fetch_all_demand_rows():
         return cursor.fetchall()
 
 
+def fetch_weather_rows():
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT date, hour, temp, humidity, wind, solar FROM weather")
+        return cursor.fetchall()
+
+
 def demand_dataframe():
     rows = fetch_all_demand_rows()
     if not rows:
@@ -214,6 +228,17 @@ def demand_dataframe():
     df = df.sort_values(["Date", "Hour", "id"]).reset_index(drop=True)
     df["Timestamp"] = df["Date"] + pd.to_timedelta(df["Hour"], unit="h")
     df["Date Label"] = df["Date"].dt.strftime("%Y-%m-%d")
+    weather_rows = fetch_weather_rows()
+    if weather_rows:
+        weather_df = pd.DataFrame(
+            weather_rows,
+            columns=["Date", "Hour", "temp", "humidity", "wind", "solar"],
+        )
+        weather_df["Date"] = pd.to_datetime(weather_df["Date"], errors="coerce")
+        weather_df["Hour"] = pd.to_numeric(weather_df["Hour"], errors="coerce")
+        weather_df = weather_df.dropna(subset=["Date", "Hour"])
+        weather_df["Hour"] = weather_df["Hour"].astype(int)
+        df = pd.merge(df, weather_df, on=["Date", "Hour"], how="left")
     return df
 
 
@@ -389,6 +414,55 @@ def forecast_with_prophet(df, target_date=None):
     )
 
 
+def add_prophet_components(df):
+    component_cols = ["prophet_trend", "prophet_yearly", "prophet_weekly", "prophet_daily"]
+    if df.empty or len(df) < 24:
+        result = df.copy()
+        for column in component_cols:
+            result[column] = 0.0
+        return result
+
+    try:
+        from prophet import Prophet
+    except ImportError:
+        result = df.copy()
+        for column in component_cols:
+            result[column] = 0.0
+        return result
+
+    prophet_df = df[["Timestamp", "Ontario Demand"]].copy()
+    prophet_df = prophet_df.dropna()
+    prophet_df = prophet_df.rename(columns={"Timestamp": "ds", "Ontario Demand": "y"})
+    if len(prophet_df) < 24:
+        result = df.copy()
+        for column in component_cols:
+            result[column] = 0.0
+        return result
+
+    model = Prophet(
+        daily_seasonality="auto",
+        weekly_seasonality="auto",
+        yearly_seasonality="auto",
+        changepoint_prior_scale=0.05,
+    )
+    model.fit(prophet_df)
+    components = model.predict(prophet_df[["ds"]])
+    component_df = pd.DataFrame(
+        {
+            "Timestamp": pd.to_datetime(prophet_df["ds"]).values,
+            "prophet_trend": components.get("trend", 0.0),
+            "prophet_yearly": components.get("yearly", 0.0),
+            "prophet_weekly": components.get("weekly", 0.0),
+            "prophet_daily": components.get("daily", 0.0),
+        }
+    )
+
+    result = pd.merge(df.copy(), component_df, on="Timestamp", how="left")
+    for column in component_cols:
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
+    return result
+
+
 def get_model_metadata_path(model_path):
     """Get the metadata file path for a model."""
     return model_path.replace(".pkl", ".meta.json")
@@ -429,14 +503,15 @@ def forecast_with_xgboost(df, target_date=None):
     except ImportError:
         from features import engineer_features, get_feature_cols
 
-    columns = ["Hour", "XGBoost Predicted"]
+    columns = ["Hour", "XGBoost Predicted", "XGBoost_P10", "XGBoost_P50", "XGBoost_P90"]
     MODEL_DIR = "models"
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     if len(df) < 500:
         return pd.DataFrame(columns=columns)
 
-    df_feat = engineer_features(df)
+    df_with_prophet = add_prophet_components(df)
+    df_feat = engineer_features(df_with_prophet)
     feature_cols = get_feature_cols(df_feat)
 
     predictions = []
@@ -448,41 +523,54 @@ def forecast_with_xgboost(df, target_date=None):
         if current_train_rows < 200:
             continue
 
-        model_path = os.path.join(MODEL_DIR, f"lgb_h{h}.pkl")
-        model = None
-        retrain = True
-
-        if os.path.exists(model_path):
-            model = joblib.load(model_path)
-            train_rows = load_model_train_rows(model_path)
-            if (
-                train_rows is not None
-                and (current_train_rows - train_rows) < FORECAST_LIGHTGBM_RETRAIN_ROWS
-            ):
-                retrain = False
-
-        if model is None or retrain:
-            model = lgb.LGBMRegressor(
-                n_estimators=500,
-                max_depth=8,
-                learning_rate=0.04,
-                num_leaves=64,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_alpha=0.05,
-                reg_lambda=0.05,
-                random_state=42,
-                n_jobs=-1,
-                verbose=-1,
-            )
-            model.fit(train[feature_cols], train["target"])
-            joblib.dump(model, model_path)
-            save_model_train_rows(model_path, len(train))
-
         X_pred = df_feat.iloc[-1:][feature_cols]
-        pred_result = cast(Any, model.predict(X_pred))
-        pred = float(pred_result[0])
-        predictions.append({"Hour": h, "XGBoost Predicted": pred})
+        horizon_preds = {}
+        for label, alpha in [("p10", 0.1), ("p50", 0.5), ("p90", 0.9)]:
+            model_path = os.path.join(MODEL_DIR, f"lgb_h{h}_{label}.pkl")
+            model = None
+            retrain = True
+
+            if os.path.exists(model_path):
+                model = joblib.load(model_path)
+                train_rows = load_model_train_rows(model_path)
+                if (
+                    train_rows is not None
+                    and (current_train_rows - train_rows) < FORECAST_LIGHTGBM_RETRAIN_ROWS
+                ):
+                    retrain = False
+
+            if model is None or retrain:
+                model = lgb.LGBMRegressor(
+                    objective="quantile",
+                    alpha=alpha,
+                    n_estimators=500,
+                    max_depth=8,
+                    learning_rate=0.04,
+                    num_leaves=64,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    reg_alpha=0.05,
+                    reg_lambda=0.05,
+                    random_state=42,
+                    n_jobs=-1,
+                    verbose=-1,
+                )
+                model.fit(train[feature_cols], train["target"])
+                joblib.dump(model, model_path)
+                save_model_train_rows(model_path, len(train))
+
+            pred_result = cast(Any, model.predict(X_pred))
+            horizon_preds[label] = float(pred_result[0])
+
+        predictions.append(
+            {
+                "Hour": h,
+                "XGBoost Predicted": horizon_preds["p50"],
+                "XGBoost_P10": horizon_preds["p10"],
+                "XGBoost_P50": horizon_preds["p50"],
+                "XGBoost_P90": horizon_preds["p90"],
+            }
+        )
 
     return pd.DataFrame(predictions, columns=columns)
 
@@ -492,20 +580,47 @@ def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
     prophet_forecast = forecast_with_prophet(training_df, target_date)
     xgboost_forecast = forecast_with_xgboost(training_df, target_date)
 
+    forecast_columns = [
+        "Hour",
+        "Prophet",
+        "XGBoost",
+        "Ensemble",
+        "Ensemble_P10",
+        "Ensemble_P50",
+        "Ensemble_P90",
+    ]
     if prophet_forecast.empty and xgboost_forecast.empty:
-        return pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"])
+        return pd.DataFrame(columns=forecast_columns)
 
     if prophet_forecast.empty:
         result = xgboost_forecast.rename(columns={"XGBoost Predicted": "Ensemble"})
         result["Prophet"] = result["Ensemble"]
         result["XGBoost"] = result["Ensemble"]
+        result["Ensemble_P10"] = result.get("XGBoost_P10", result["Ensemble"])
+        result["Ensemble_P50"] = result.get("XGBoost_P50", result["Ensemble"])
+        result["Ensemble_P90"] = result.get("XGBoost_P90", result["Ensemble"])
     elif xgboost_forecast.empty:
         result = prophet_forecast.rename(columns={"Prophet Predicted": "Ensemble"})
         result["Prophet"] = result["Ensemble"]
         result["XGBoost"] = result["Ensemble"]
+        result["Ensemble_P10"] = result["Ensemble"]
+        result["Ensemble_P50"] = result["Ensemble"]
+        result["Ensemble_P90"] = result["Ensemble"]
     else:
         merged = pd.merge(prophet_forecast, xgboost_forecast, on="Hour", how="outer")
         merged["Ensemble"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged["XGBoost Predicted"]
+        merged["Ensemble_P10"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged.get(
+            "XGBoost_P10",
+            merged["XGBoost Predicted"],
+        )
+        merged["Ensemble_P50"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged.get(
+            "XGBoost_P50",
+            merged["XGBoost Predicted"],
+        )
+        merged["Ensemble_P90"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged.get(
+            "XGBoost_P90",
+            merged["XGBoost Predicted"],
+        )
         result = merged.rename(
             columns={
                 "Prophet Predicted": "Prophet",
@@ -513,7 +628,10 @@ def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
             }
         )
 
-    return result[["Hour", "Prophet", "XGBoost", "Ensemble"]]
+    for column in forecast_columns:
+        if column not in result.columns:
+            result[column] = pd.NA
+    return result[forecast_columns]
 
 
 def normalize_target_date(df, target_date=None):
@@ -855,6 +973,36 @@ async def dashboard_data():
         "records": records_df.to_dict(orient="records"),
         "baseline": baseline.to_dict(orient="records"),
         "total_records": total_records,
+    }
+
+
+@app.post("/weather/backfill")
+async def weather_backfill(
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+):
+    try:
+        from server.weather import fetch_weather_frame, upsert_weather_rows
+    except ImportError:
+        from weather import fetch_weather_frame, upsert_weather_rows
+
+    df = demand_dataframe()
+    if df.empty and (start_date is None or end_date is None):
+        return {"status": "empty", "saved": 0, "message": "No demand rows or date range available."}
+
+    start = start_date or pd.Timestamp(df["Date"].min()).date().isoformat()
+    end = end_date or pd.Timestamp(df["Date"].max()).date().isoformat()
+    weather_df = fetch_weather_frame(WEATHER_LATITUDE, WEATHER_LONGITUDE, start, end)
+    with get_connection() as conn:
+        saved = upsert_weather_rows(conn, weather_df.to_dict(orient="records"))
+
+    return {
+        "status": "saved",
+        "saved": saved,
+        "start_date": start,
+        "end_date": end,
+        "latitude": WEATHER_LATITUDE,
+        "longitude": WEATHER_LONGITUDE,
     }
 
 
