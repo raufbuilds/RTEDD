@@ -140,7 +140,14 @@ def init_db():
             "date TEXT, hour INTEGER, demand REAL)"
         )
         curr.execute(
-            "CREATE INDEX IF NOT EXISTS idx_demand_date_hour "
+            "DELETE FROM demand "
+            "WHERE id NOT IN ("
+            "SELECT MIN(id) FROM demand GROUP BY date, hour"
+            ")"
+        )
+        curr.execute("DROP INDEX IF EXISTS idx_demand_date_hour")
+        curr.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_demand_date_hour "
             "ON demand(date, hour)"
         )
         curr.execute(
@@ -514,10 +521,11 @@ def forecast_with_xgboost(df, target_date=None):
     df_feat = engineer_features(df_with_prophet)
     feature_cols = get_feature_cols(df_feat)
 
+    last_timestamp = pd.Timestamp(df_feat.iloc[-1]["Timestamp"])
     predictions = []
-    for h in range(24):
+    for horizon in range(1, 25):
         train = df_feat.copy()
-        train["target"] = train["Ontario Demand"].shift(-h)
+        train["target"] = train["Ontario Demand"].shift(-horizon)
         train = train.dropna(subset=["target"])
         current_train_rows = len(train)
         if current_train_rows < 200:
@@ -526,7 +534,7 @@ def forecast_with_xgboost(df, target_date=None):
         X_pred = df_feat.iloc[-1:][feature_cols]
         horizon_preds = {}
         for label, alpha in [("p10", 0.1), ("p50", 0.5), ("p90", 0.9)]:
-            model_path = os.path.join(MODEL_DIR, f"lgb_h{h}_{label}.pkl")
+            model_path = os.path.join(MODEL_DIR, f"lgb_h{horizon}_{label}.pkl")
             model = None
             retrain = True
 
@@ -552,7 +560,7 @@ def forecast_with_xgboost(df, target_date=None):
                     reg_alpha=0.05,
                     reg_lambda=0.05,
                     random_state=42,
-                    n_jobs=-1,
+                    n_jobs=FORECAST_XGBOOST_N_JOBS,
                     verbose=-1,
                 )
                 model.fit(train[feature_cols], train["target"])
@@ -564,7 +572,7 @@ def forecast_with_xgboost(df, target_date=None):
 
         predictions.append(
             {
-                "Hour": h,
+                "Hour": int((last_timestamp + pd.Timedelta(hours=horizon)).hour),
                 "XGBoost Predicted": horizon_preds["p50"],
                 "XGBoost_P10": horizon_preds["p10"],
                 "XGBoost_P50": horizon_preds["p50"],
@@ -845,21 +853,20 @@ async def ingest(data: dict):
     with get_connection() as conn:
         curr = conn.cursor()
         curr.execute(
+            "INSERT OR IGNORE INTO demand (date, hour, demand) VALUES (?,?,?)",
+            (date_value, hour_value, demand_value),
+        )
+        conn.commit()
+        if curr.rowcount:
+            return {"status": "saved", "id": curr.lastrowid}
+
+        curr.execute(
             "SELECT id FROM demand WHERE date = ? AND hour = ? LIMIT 1",
             (date_value, hour_value),
         )
         existing = curr.fetchone()
-
-        if existing:
-            return {"status": "skipped", "reason": "duplicate", "id": existing[0]}
-
-        curr.execute(
-            "INSERT INTO demand (date, hour, demand) VALUES (?,?,?)",
-            (date_value, hour_value, demand_value),
-        )
-        conn.commit()
-        inserted_id = curr.lastrowid
-        return {"status": "saved", "id": inserted_id}
+        existing_id = existing[0] if existing else None
+        return {"status": "skipped", "reason": "duplicate", "id": existing_id}
 
 
 def normalize_ingest_record(data: dict):
@@ -908,18 +915,13 @@ async def ingest_bulk(data: dict):
         curr = conn.cursor()
         for date_value, hour_value, demand_value in normalized_rows:
             curr.execute(
-                "SELECT id FROM demand WHERE date = ? AND hour = ? LIMIT 1",
-                (date_value, hour_value),
-            )
-            if curr.fetchone():
-                skipped += 1
-                continue
-
-            curr.execute(
-                "INSERT INTO demand (date, hour, demand) VALUES (?,?,?)",
+                "INSERT OR IGNORE INTO demand (date, hour, demand) VALUES (?,?,?)",
                 (date_value, hour_value, demand_value),
             )
-            saved += 1
+            if curr.rowcount:
+                saved += 1
+            else:
+                skipped += 1
 
         conn.commit()
 
