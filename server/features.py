@@ -3,22 +3,30 @@ import numpy as np
 import pandas as pd
 
 
-ONTARIO_HOLIDAYS = country_holidays("CA", subdiv="ON", years=range(2020, 2026))
+def _feature_years(timestamp):
+    years = pd.to_datetime(timestamp, errors="coerce").dt.year.dropna()
+    if years.empty:
+        current_year = pd.Timestamp.today().year
+        return range(current_year - 1, current_year + 2)
+
+    start_year = int(years.min()) - 1
+    end_year = int(years.max()) + 2
+    return range(start_year, end_year)
 
 
-def _days_to_nearest_holiday(date_value):
+def _days_to_nearest_holiday(date_value, holidays):
     current_date = pd.Timestamp(date_value).date()
     distances = [
         abs(offset)
         for offset in range(-7, 8)
-        if current_date + pd.Timedelta(days=offset) in ONTARIO_HOLIDAYS
+        if current_date + pd.Timedelta(days=offset) in holidays
     ]
     return min(distances) if distances else 8
 
 
-def _dst_transition_dates():
+def _dst_transition_dates(years):
     dates = set()
-    for year in range(2020, 2026):
+    for year in years:
         march = pd.Timestamp(year=year, month=3, day=1)
         november = pd.Timestamp(year=year, month=11, day=1)
 
@@ -30,9 +38,6 @@ def _dst_transition_dates():
         dates.add(second_sunday_march.date())
         dates.add(first_sunday_november.date())
     return dates
-
-
-ONTARIO_DST_TRANSITIONS = _dst_transition_dates()
 
 
 def engineer_features(df):
@@ -67,10 +72,16 @@ def engineer_features(df):
     df["dow"] = dow
     df["days_since_start"] = (timestamp.dt.normalize() - timestamp.min().normalize()).dt.days
 
+    years = _feature_years(timestamp)
+    ontario_holidays = country_holidays("CA", subdiv="ON", years=years)
+    ontario_dst_transitions = _dst_transition_dates(years)
+
     dates = timestamp.dt.date
-    df["is_holiday"] = dates.isin(ONTARIO_HOLIDAYS).astype(int)
-    df["days_to_nearest_holiday"] = dates.map(_days_to_nearest_holiday)
-    df["is_dst"] = dates.isin(ONTARIO_DST_TRANSITIONS).astype(int)
+    df["is_holiday"] = dates.isin(ontario_holidays).astype(int)
+    df["days_to_nearest_holiday"] = dates.map(
+        lambda date_value: _days_to_nearest_holiday(date_value, ontario_holidays)
+    )
+    df["is_dst"] = dates.isin(ontario_dst_transitions).astype(int)
 
     weather_defaults = {
         "temp": 18.0,
