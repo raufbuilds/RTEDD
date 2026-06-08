@@ -1,19 +1,31 @@
-from contextlib import contextmanager
 import asyncio
+from datetime import datetime, timezone
 import json
+import logging
 import os
-from queue import Queue
-import sqlite3
 import threading
-import time
 from typing import Any, Optional, cast
 
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from server.database import async_session_factory, engine, get_db
+from server.models import Demand, ForecastCache, Weather
+from server.schemas import (
+    ForecastResponse,
+    HealthResponse,
+    IngestBulkRequest,
+    IngestBulkResponse,
+    IngestRecord,
+    IngestResponse,
+)
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
 
 
 class RequestSizeLimitMiddleware:
@@ -47,34 +59,29 @@ class RequestSizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        body = b""
-        more_body = True
-        while more_body:
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
             message = await receive()
             if message["type"] == "http.request":
-                body += message.get("body", b"")
-                more_body = message.get("more_body", False)
-                if len(body) > self.max_size:
-                    response = JSONResponse(
-                        status_code=413,
-                        content={"detail": "Request body too large"},
-                    )
-                    await response(scope, receive, send)
-                    return
-            else:
-                await self.app(scope, receive, send)
-                return
+                received += len(message.get("body", b""))
+                if received > self.max_size:
+                    raise RequestBodyTooLarge
+            return message
 
-        body_sent = False
+        try:
+            await self.app(scope, limited_receive, send)
+        except RequestBodyTooLarge:
+            response = JSONResponse(
+                status_code=413,
+                content={"detail": "Request body too large"},
+            )
+            await response(scope, receive, send)
 
-        async def replay_receive():
-            nonlocal body_sent
-            if body_sent:
-                return {"type": "http.request", "body": b"", "more_body": False}
-            body_sent = True
-            return {"type": "http.request", "body": body, "more_body": False}
 
-        await self.app(scope, replay_receive, send)
+class RequestBodyTooLarge(Exception):
+    pass
 
 
 def load_env_file(path=".env"):
@@ -92,8 +99,6 @@ def load_env_file(path=".env"):
 
 load_env_file()
 
-DB_PATH = os.getenv("DB_PATH", "data.db")
-DB_POOL_SIZE = max(1, int(os.getenv("DB_POOL_SIZE", "5")))
 MAX_REQUEST_SIZE_BYTES = int(os.getenv("MAX_REQUEST_SIZE_BYTES", str(1024 * 1024)))
 MAX_BULK_INGEST_ROWS = int(os.getenv("MAX_BULK_INGEST_ROWS", "5000"))
 FORECAST_REFRESH_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))
@@ -102,126 +107,60 @@ FORECAST_LIGHTGBM_RETRAIN_ROWS = int(os.getenv("FORECAST_LIGHTGBM_RETRAIN_ROWS",
 WEATHER_LATITUDE = float(os.getenv("WEATHER_LATITUDE", "43.6532"))
 WEATHER_LONGITUDE = float(os.getenv("WEATHER_LONGITUDE", "-79.3832"))
 
-connection_pool = Queue(maxsize=DB_POOL_SIZE)
 forecast_training_lock = threading.Lock()
 forecast_training_keys: set[str] = set()
 app.add_middleware(RequestSizeLimitMiddleware, max_size=MAX_REQUEST_SIZE_BYTES)
 
 
-def create_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+@app.get("/health", response_model=HealthResponse)
+async def health(db: AsyncSession = Depends(get_db)):
+    await db.execute(text("SELECT 1"))
+    return HealthResponse(status="ok", database="postgresql")
 
 
-for _ in range(DB_POOL_SIZE):
-    connection_pool.put(create_connection())
+async def fetch_rows(db: AsyncSession, after_id: int = 0, limit: Optional[int] = None):
+    query = (
+        select(Demand.id, Demand.date, Demand.hour, Demand.demand)
+        .where(Demand.id > after_id)
+        .order_by(Demand.id.asc())
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    result = await db.execute(query)
+    return result.all()
 
 
-@contextmanager
-def get_connection():
-    conn = connection_pool.get()
-    try:
-        yield conn
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        connection_pool.put(conn)
+async def fetch_record_count(db: AsyncSession):
+    result = await db.execute(select(func.count()).select_from(Demand))
+    return int(result.scalar_one())
 
 
-def init_db():
-    with get_connection() as conn:
-        curr = conn.cursor()
-        curr.execute(
-            "CREATE TABLE IF NOT EXISTS demand ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "date TEXT, hour INTEGER, demand REAL)"
-        )
-        curr.execute(
-            "DELETE FROM demand "
-            "WHERE id NOT IN ("
-            "SELECT MIN(id) FROM demand GROUP BY date, hour"
-            ")"
-        )
-        curr.execute("DROP INDEX IF EXISTS idx_demand_date_hour")
-        curr.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_demand_date_hour "
-            "ON demand(date, hour)"
-        )
-        curr.execute(
-            "CREATE TABLE IF NOT EXISTS forecast_cache ("
-            "cache_key TEXT PRIMARY KEY, "
-            "target_date TEXT, "
-            "include_target_date INTEGER, "
-            "signature TEXT, "
-            "result_json TEXT, "
-            "status TEXT, "
-            "error TEXT, "
-            "trained_at REAL, "
-            "requested_at REAL)"
-        )
-        curr.execute(
-            "CREATE TABLE IF NOT EXISTS weather ("
-            "date TEXT, hour INTEGER, temp REAL, humidity REAL, wind REAL, solar REAL, "
-            "PRIMARY KEY(date, hour))"
-        )
-        conn.commit()
+async def fetch_latest_progress(db: AsyncSession):
+    result = await db.execute(
+        select(Demand.id, Demand.date, Demand.hour, Demand.demand)
+        .order_by(Demand.date.desc(), Demand.hour.desc(), Demand.id.desc())
+        .limit(1)
+    )
+    return result.first()
 
 
-init_db()
+async def fetch_all_demand_rows(db: AsyncSession):
+    result = await db.execute(
+        select(Demand.id, Demand.date, Demand.hour, Demand.demand)
+        .order_by(Demand.date.asc(), Demand.hour.asc(), Demand.id.asc())
+    )
+    return result.all()
 
 
-def fetch_rows(after_id: int = 0, limit: Optional[int] = None):
-    with get_connection() as conn:
-        cursor = conn.cursor()
-
-        query = "SELECT id, date, hour, demand FROM demand WHERE id > ? ORDER BY id ASC"
-        params = [after_id]
-
-        if limit is not None:
-            query += " LIMIT ?"
-            params.append(limit)
-
-        cursor.execute(query, params)
-        return cursor.fetchall()
+async def fetch_weather_rows(db: AsyncSession):
+    result = await db.execute(
+        select(Weather.date, Weather.hour, Weather.temp, Weather.humidity, Weather.wind, Weather.solar)
+    )
+    return result.all()
 
 
-def fetch_record_count():
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM demand")
-        row = cursor.fetchone()
-        return int(row[0]) if row else 0
-
-
-def fetch_latest_progress():
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, date, hour, demand FROM demand "
-            "ORDER BY date DESC, hour DESC, id DESC LIMIT 1"
-        )
-        return cursor.fetchone()
-
-
-def fetch_all_demand_rows():
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, date, hour, demand FROM demand ORDER BY date ASC, hour ASC, id ASC")
-        return cursor.fetchall()
-
-
-def fetch_weather_rows():
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT date, hour, temp, humidity, wind, solar FROM weather")
-        return cursor.fetchall()
-
-
-def demand_dataframe():
-    rows = fetch_all_demand_rows()
+async def demand_dataframe(db: AsyncSession):
+    rows = await fetch_all_demand_rows(db)
     if not rows:
         return pd.DataFrame(columns=["id", "Date", "Hour", "Ontario Demand", "Timestamp"])
 
@@ -235,7 +174,7 @@ def demand_dataframe():
     df = df.sort_values(["Date", "Hour", "id"]).reset_index(drop=True)
     df["Timestamp"] = df["Date"] + pd.to_timedelta(df["Hour"], unit="h")
     df["Date Label"] = df["Date"].dt.strftime("%Y-%m-%d")
-    weather_rows = fetch_weather_rows()
+    weather_rows = await fetch_weather_rows(db)
     if weather_rows:
         weather_df = pd.DataFrame(
             weather_rows,
@@ -526,7 +465,7 @@ def forecast_with_xgboost(df, target_date=None):
     for horizon in range(1, 25):
         train = df_feat.copy()
         train["target"] = train["Ontario Demand"].shift(-horizon)
-        train = train.dropna(subset=["target"])
+        train = train.dropna(subset=feature_cols + ["target"])
         current_train_rows = len(train)
         if current_train_rows < 200:
             continue
@@ -654,59 +593,47 @@ def forecast_cache_key(target_date: str, include_target_date: bool):
     return f"{target_date}|include_today={int(include_target_date)}"
 
 
-def get_cached_forecast(cache_key: str):
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT cache_key, target_date, include_target_date, signature, result_json, "
-            "status, error, trained_at, requested_at FROM forecast_cache WHERE cache_key = ?",
-            (cache_key,),
-        )
-        row = cursor.fetchone()
+def epoch_seconds(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return value.timestamp()
 
+
+def cache_row_to_dict(row: ForecastCache | None):
     if row is None:
         return None
-
-    result = json.loads(row[4]) if row[4] else []
     return {
-        "cache_key": row[0],
-        "target_date": row[1],
-        "include_target_date": bool(row[2]),
-        "signature": json.loads(row[3]) if row[3] else None,
-        "forecast": result,
-        "status": row[5],
-        "error": row[6],
-        "trained_at": row[7],
-        "requested_at": row[8],
+        "cache_key": row.cache_key,
+        "target_date": row.target_date.isoformat(),
+        "include_target_date": bool(row.include_target_date),
+        "signature": row.signature,
+        "forecast": row.result_json or [],
+        "status": row.status,
+        "error": row.error,
+        "trained_at": epoch_seconds(row.trained_at),
+        "requested_at": epoch_seconds(row.requested_at),
     }
 
 
-def get_latest_fresh_forecast(include_target_date: bool):
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT cache_key, target_date, include_target_date, signature, result_json, "
-            "status, error, trained_at, requested_at FROM forecast_cache "
-            "WHERE include_target_date = ? AND status = 'fresh' AND result_json IS NOT NULL "
-            "ORDER BY trained_at DESC LIMIT 1",
-            (int(include_target_date),),
+async def get_cached_forecast(db: AsyncSession, cache_key: str):
+    result = await db.execute(select(ForecastCache).where(ForecastCache.cache_key == cache_key))
+    return cache_row_to_dict(result.scalar_one_or_none())
+
+
+async def get_latest_fresh_forecast(db: AsyncSession, include_target_date: bool):
+    result = await db.execute(
+        select(ForecastCache)
+        .where(
+            ForecastCache.include_target_date == include_target_date,
+            ForecastCache.status == "fresh",
+            ForecastCache.result_json.is_not(None),
         )
-        row = cursor.fetchone()
-
-    if row is None:
-        return None
-
-    return {
-        "cache_key": row[0],
-        "target_date": row[1],
-        "include_target_date": bool(row[2]),
-        "signature": json.loads(row[3]) if row[3] else None,
-        "forecast": json.loads(row[4]) if row[4] else [],
-        "status": row[5],
-        "error": row[6],
-        "trained_at": row[7],
-        "requested_at": row[8],
-    }
+        .order_by(ForecastCache.trained_at.desc())
+        .limit(1)
+    )
+    return cache_row_to_dict(result.scalar_one_or_none())
 
 
 def forecast_training_seconds(cached, now=None):
@@ -715,9 +642,9 @@ def forecast_training_seconds(cached, now=None):
 
     end_time = cached.get("trained_at") if cached.get("status") in {"fresh", "failed", "empty"} else now
     if end_time is None:
-        end_time = time.time()
+        end_time = datetime.now(timezone.utc).timestamp()
 
-    return max(0.0, float(end_time) - float(cached["requested_at"]))
+    return max(0.0, epoch_seconds(end_time) - epoch_seconds(cached["requested_at"]))
 
 
 def forecast_summary(status, stale=False, error=None, training_seconds=None):
@@ -738,7 +665,8 @@ def forecast_summary(status, stale=False, error=None, training_seconds=None):
     return "Forecast status is pending."
 
 
-def save_forecast_cache(
+async def save_forecast_cache(
+    db: AsyncSession,
     cache_key: str,
     target_date: str,
     include_target_date: bool,
@@ -747,87 +675,96 @@ def save_forecast_cache(
     status: str,
     error: Optional[str] = None,
 ):
-    result_json = result.to_json(orient="records") if result is not None else None
-    now = time.time()
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO forecast_cache "
-            "(cache_key, target_date, include_target_date, signature, result_json, status, error, trained_at, requested_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(cache_key) DO UPDATE SET "
-            "target_date = excluded.target_date, "
-            "include_target_date = excluded.include_target_date, "
-            "signature = excluded.signature, "
-            "result_json = excluded.result_json, "
-            "status = excluded.status, "
-            "error = excluded.error, "
-            "trained_at = excluded.trained_at, "
-            "requested_at = excluded.requested_at",
-            (
-                cache_key,
-                target_date,
-                int(include_target_date),
-                json.dumps(signature),
-                result_json,
-                status,
-                error,
-                now,
-                now,
-            ),
+    result_json = json.loads(result.to_json(orient="records")) if result is not None else None
+    now = datetime.now(timezone.utc)
+    statement = pg_insert(ForecastCache).values(
+        cache_key=cache_key,
+        target_date=pd.Timestamp(target_date).date(),
+        include_target_date=include_target_date,
+        signature=list(signature) if isinstance(signature, tuple) else signature,
+        result_json=result_json,
+        status=status,
+        error=error,
+        trained_at=now,
+        requested_at=now,
+    )
+    update_values = {
+        "target_date": statement.excluded.target_date,
+        "include_target_date": statement.excluded.include_target_date,
+        "signature": statement.excluded.signature,
+        "result_json": statement.excluded.result_json,
+        "status": statement.excluded.status,
+        "error": statement.excluded.error,
+        "trained_at": statement.excluded.trained_at,
+        "requested_at": statement.excluded.requested_at,
+    }
+    await db.execute(statement.on_conflict_do_update(index_elements=[ForecastCache.cache_key], set_=update_values))
+    await db.commit()
+
+
+async def mark_forecast_requested(
+    db: AsyncSession,
+    cache_key: str,
+    target_date: str,
+    include_target_date: bool,
+    status: str,
+):
+    now = datetime.now(timezone.utc)
+    statement = pg_insert(ForecastCache).values(
+        cache_key=cache_key,
+        target_date=pd.Timestamp(target_date).date(),
+        include_target_date=include_target_date,
+        status=status,
+        requested_at=now,
+    )
+    await db.execute(
+        statement.on_conflict_do_update(
+            index_elements=[ForecastCache.cache_key],
+            set_={"status": statement.excluded.status, "requested_at": statement.excluded.requested_at},
         )
-        conn.commit()
+    )
+    await db.commit()
 
 
-def mark_forecast_requested(cache_key: str, target_date: str, include_target_date: bool, status: str):
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO forecast_cache "
-            "(cache_key, target_date, include_target_date, status, requested_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(cache_key) DO UPDATE SET "
-            "status = excluded.status, requested_at = excluded.requested_at",
-            (cache_key, target_date, int(include_target_date), status, time.time()),
-        )
-        conn.commit()
-
-
-def refresh_forecast_cache(target_date: str, include_target_date: bool):
+async def refresh_forecast_cache(target_date: str, include_target_date: bool):
     cache_key = forecast_cache_key(target_date, include_target_date)
 
-    try:
-        mark_forecast_requested(cache_key, target_date, include_target_date, "training")
-        df = demand_dataframe()
-        if df.empty:
-            save_forecast_cache(
+    async with async_session_factory() as db:
+        try:
+            await mark_forecast_requested(db, cache_key, target_date, include_target_date, "training")
+            df = await demand_dataframe(db)
+            if df.empty:
+                await save_forecast_cache(
+                    db,
+                    cache_key,
+                    target_date,
+                    include_target_date,
+                    forecast_cache_signature(df, target_date, include_target_date),
+                    pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"]),
+                    "empty",
+                    "No demand records are available.",
+                )
+                return
+
+            training_df = forecast_training_frame(df, target_date, include_target_date)
+            signature = forecast_cache_signature(training_df, target_date, include_target_date)
+            result = compute_ensemble_forecast(df, target_date, include_target_date)
+            await save_forecast_cache(db, cache_key, target_date, include_target_date, signature, result, "fresh")
+        except Exception as exc:
+            logger.exception("Forecast refresh failed")
+            await save_forecast_cache(
+                db,
                 cache_key,
                 target_date,
                 include_target_date,
-                forecast_cache_signature(df, target_date, include_target_date),
+                None,
                 pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"]),
-                "empty",
-                "No demand records are available.",
+                "failed",
+                str(exc),
             )
-            return
-
-        training_df = forecast_training_frame(df, target_date, include_target_date)
-        signature = forecast_cache_signature(training_df, target_date, include_target_date)
-        result = compute_ensemble_forecast(df, target_date, include_target_date)
-        save_forecast_cache(cache_key, target_date, include_target_date, signature, result, "fresh")
-    except Exception as exc:
-        save_forecast_cache(
-            cache_key,
-            target_date,
-            include_target_date,
-            None,
-            pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"]),
-            "failed",
-            str(exc),
-        )
-    finally:
-        with forecast_training_lock:
-            forecast_training_keys.discard(cache_key)
+        finally:
+            with forecast_training_lock:
+                forecast_training_keys.discard(cache_key)
 
 
 def schedule_forecast_refresh(
@@ -844,49 +781,33 @@ def schedule_forecast_refresh(
     background_tasks.add_task(refresh_forecast_cache, target_date, include_target_date)
 
 
-@app.post("/ingest")
-async def ingest(data: dict):
-    date_value = data.get("Date")
-    hour_value = data.get("Hour")
-    demand_value = data.get("Ontario Demand")
+@app.post("/ingest", response_model=IngestResponse)
+async def ingest(record: IngestRecord, db: AsyncSession = Depends(get_db)):
+    statement = (
+        pg_insert(Demand)
+        .values(date=record.date, hour=record.hour, demand=record.demand)
+        .on_conflict_do_nothing(index_elements=["date", "hour"])
+        .returning(Demand.id)
+    )
+    result = await db.execute(statement)
+    inserted_id = result.scalar_one_or_none()
+    await db.commit()
+    if inserted_id is not None:
+        return IngestResponse(status="saved", id=inserted_id)
 
-    with get_connection() as conn:
-        curr = conn.cursor()
-        curr.execute(
-            "INSERT OR IGNORE INTO demand (date, hour, demand) VALUES (?,?,?)",
-            (date_value, hour_value, demand_value),
-        )
-        conn.commit()
-        if curr.rowcount:
-            return {"status": "saved", "id": curr.lastrowid}
-
-        curr.execute(
-            "SELECT id FROM demand WHERE date = ? AND hour = ? LIMIT 1",
-            (date_value, hour_value),
-        )
-        existing = curr.fetchone()
-        existing_id = existing[0] if existing else None
-        return {"status": "skipped", "reason": "duplicate", "id": existing_id}
-
-
-def normalize_ingest_record(data: dict):
-    return (
-        data.get("Date"),
-        data.get("Hour"),
-        data.get("Ontario Demand"),
+    existing = await db.execute(
+        select(Demand.id).where(Demand.date == record.date, Demand.hour == record.hour).limit(1)
+    )
+    return IngestResponse(
+        status="skipped",
+        reason="duplicate",
+        id=existing.scalar_one_or_none(),
     )
 
 
-@app.post("/ingest/bulk")
-async def ingest_bulk(data: dict):
-    rows = data.get("rows")
-    if not isinstance(rows, list):
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "detail": "Expected a JSON body with a rows list."},
-        )
-
-    if len(rows) > MAX_BULK_INGEST_ROWS:
+@app.post("/ingest/bulk", response_model=IngestBulkResponse)
+async def ingest_bulk(data: IngestBulkRequest, db: AsyncSession = Depends(get_db)):
+    if len(data.rows) > MAX_BULK_INGEST_ROWS:
         return JSONResponse(
             status_code=413,
             content={
@@ -895,52 +816,41 @@ async def ingest_bulk(data: dict):
             },
         )
 
-    normalized_rows = []
-    invalid = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            invalid += 1
-            continue
-
-        date_value, hour_value, demand_value = normalize_ingest_record(row)
-        if date_value is None or hour_value is None or demand_value is None:
-            invalid += 1
-            continue
-
-        normalized_rows.append((date_value, hour_value, demand_value))
+    values = [
+        {"date": row.date, "hour": row.hour, "demand": row.demand}
+        for row in data.rows
+    ]
 
     saved = 0
-    skipped = 0
-    with get_connection() as conn:
-        curr = conn.cursor()
-        for date_value, hour_value, demand_value in normalized_rows:
-            curr.execute(
-                "INSERT OR IGNORE INTO demand (date, hour, demand) VALUES (?,?,?)",
-                (date_value, hour_value, demand_value),
-            )
-            if curr.rowcount:
-                saved += 1
-            else:
-                skipped += 1
+    if values:
+        statement = (
+            pg_insert(Demand)
+            .values(values)
+            .on_conflict_do_nothing(index_elements=["date", "hour"])
+            .returning(Demand.id)
+        )
+        result = await db.execute(statement)
+        saved = len(result.scalars().all())
+        await db.commit()
+    skipped = len(values) - saved
 
-        conn.commit()
-
-    return {
-        "status": "saved",
-        "received": len(rows),
-        "valid": len(normalized_rows),
-        "saved": saved,
-        "skipped": skipped,
-        "invalid": invalid,
-    }
+    return IngestBulkResponse(
+        status="saved",
+        received=len(data.rows),
+        valid=len(values),
+        saved=saved,
+        skipped=skipped,
+        invalid=0,
+    )
 
 
 @app.get("/records")
 async def records(
     after_id: int = Query(0, ge=0),
     limit: Optional[int] = Query(None, ge=1, le=10000),
+    db: AsyncSession = Depends(get_db),
 ):
-    rows = fetch_rows(after_id=after_id, limit=limit)
+    rows = await fetch_rows(db, after_id=after_id, limit=limit)
     return [
         {
             "id": row[0],
@@ -954,12 +864,13 @@ async def records(
 
 @app.get("/records/count")
 async def records_count():
-    return {"total_records": fetch_record_count()}
+    async with async_session_factory() as db:
+        return {"total_records": await fetch_record_count(db)}
 
 
 @app.get("/dashboard/data")
-async def dashboard_data():
-    df = demand_dataframe()
+async def dashboard_data(db: AsyncSession = Depends(get_db)):
+    df = await demand_dataframe(db)
     total_records = len(df)
     if df.empty:
         return {"records": [], "baseline": [], "total_records": total_records}
@@ -982,21 +893,49 @@ async def dashboard_data():
 async def weather_backfill(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
 ):
     try:
-        from server.weather import fetch_weather_frame, upsert_weather_rows
+        from server.weather import fetch_weather_frame
     except ImportError:
-        from weather import fetch_weather_frame, upsert_weather_rows
+        from weather import fetch_weather_frame
 
-    df = demand_dataframe()
+    df = await demand_dataframe(db)
     if df.empty and (start_date is None or end_date is None):
         return {"status": "empty", "saved": 0, "message": "No demand rows or date range available."}
 
     start = start_date or pd.Timestamp(df["Date"].min()).date().isoformat()
     end = end_date or pd.Timestamp(df["Date"].max()).date().isoformat()
     weather_df = fetch_weather_frame(WEATHER_LATITUDE, WEATHER_LONGITUDE, start, end)
-    with get_connection() as conn:
-        saved = upsert_weather_rows(conn, weather_df.to_dict(orient="records"))
+    rows = weather_df.to_dict(orient="records")
+    saved = 0
+    if rows:
+        statement = pg_insert(Weather).values(
+            [
+                {
+                    "date": pd.Timestamp(row["date"]).date(),
+                    "hour": int(row["hour"]),
+                    "temp": row.get("temp"),
+                    "humidity": row.get("humidity"),
+                    "wind": row.get("wind"),
+                    "solar": row.get("solar"),
+                    "data_source": "open-meteo",
+                }
+                for row in rows
+            ]
+        )
+        update_values = {
+            "temp": statement.excluded.temp,
+            "humidity": statement.excluded.humidity,
+            "wind": statement.excluded.wind,
+            "solar": statement.excluded.solar,
+            "data_source": statement.excluded.data_source,
+        }
+        result = await db.execute(
+            statement.on_conflict_do_update(index_elements=["date", "hour"], set_=update_values)
+        )
+        await db.commit()
+        saved = result.rowcount or len(rows)
 
     return {
         "status": "saved",
@@ -1009,8 +948,8 @@ async def weather_backfill(
 
 
 @app.get("/latest")
-async def latest():
-    row = fetch_latest_progress()
+async def latest(db: AsyncSession = Depends(get_db)):
+    row = await fetch_latest_progress(db)
     if row is None:
         return {"id": None, "Date": None, "Hour": None, "Ontario Demand": None}
 
@@ -1022,13 +961,14 @@ async def latest():
     }
 
 
-@app.get("/forecast/latest")
+@app.get("/forecast/latest", response_model=ForecastResponse)
 async def forecast_latest(
     background_tasks: BackgroundTasks,
     target_date: Optional[str] = Query(None),
     include_target_date: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
 ):
-    df = demand_dataframe()
+    df = await demand_dataframe(db)
     normalized_target_date = normalize_target_date(df, target_date)
     if normalized_target_date is None:
         return {
@@ -1045,7 +985,7 @@ async def forecast_latest(
         }
 
     cache_key = forecast_cache_key(normalized_target_date, include_target_date)
-    cached = get_cached_forecast(cache_key)
+    cached = await get_cached_forecast(db, cache_key)
 
     training_df = forecast_training_frame(df, normalized_target_date, include_target_date)
     current_signature = forecast_cache_signature(
@@ -1053,7 +993,7 @@ async def forecast_latest(
         normalized_target_date,
         include_target_date,
     )
-    now = time.time()
+    now = datetime.now(timezone.utc).timestamp()
 
     is_missing = cached is None or not cached.get("forecast")
     is_stale = cached is not None and (
@@ -1065,81 +1005,81 @@ async def forecast_latest(
         schedule_forecast_refresh(background_tasks, normalized_target_date, include_target_date)
 
     if cached is None:
-        fallback = get_latest_fresh_forecast(include_target_date)
+        fallback = await get_latest_fresh_forecast(db, include_target_date)
         if fallback is not None and fallback.get("forecast"):
-            return {
-                "status": "training",
-                "target_date": normalized_target_date,
-                "include_target_date": include_target_date,
-                "forecast": fallback["forecast"],
-                "trained_at": fallback["trained_at"],
-                "requested_at": None,
-                "training_seconds": None,
-                "stale": True,
-                "error": None,
-                "message": "Forecast training has been queued.",
-                "summary": (
+            return ForecastResponse(
+                status="training",
+                target_date=normalized_target_date,
+                include_target_date=include_target_date,
+                forecast=fallback["forecast"],
+                trained_at=fallback["trained_at"],
+                requested_at=None,
+                training_seconds=None,
+                stale=True,
+                error=None,
+                message="Forecast training has been queued.",
+                summary=(
                     f"Showing last saved forecast for {fallback['target_date']} "
                     f"while {normalized_target_date} trains."
                 ),
-            }
-        return {
-            "status": "training",
-            "target_date": normalized_target_date,
-            "include_target_date": include_target_date,
-            "forecast": [],
-            "trained_at": None,
-            "requested_at": None,
-            "training_seconds": None,
-            "stale": True,
-            "message": "Forecast training has been queued.",
-            "summary": "Forecast training has been queued.",
-        }
+            )
+        return ForecastResponse(
+            status="training",
+            target_date=normalized_target_date,
+            include_target_date=include_target_date,
+            forecast=[],
+            trained_at=None,
+            requested_at=None,
+            training_seconds=None,
+            stale=True,
+            message="Forecast training has been queued.",
+            summary="Forecast training has been queued.",
+        )
 
     if is_missing:
-        fallback = get_latest_fresh_forecast(include_target_date)
+        fallback = await get_latest_fresh_forecast(db, include_target_date)
         if fallback is not None and fallback.get("forecast"):
             training_seconds = forecast_training_seconds(cached, now)
-            return {
-                "status": cached["status"],
-                "target_date": normalized_target_date,
-                "include_target_date": include_target_date,
-                "forecast": fallback["forecast"],
-                "trained_at": fallback["trained_at"],
-                "requested_at": cached["requested_at"],
-                "training_seconds": training_seconds,
-                "stale": True,
-                "error": cached["error"],
-                "message": "Forecast refresh has been queued.",
-                "summary": (
+            return ForecastResponse(
+                status=cached["status"],
+                target_date=normalized_target_date,
+                include_target_date=include_target_date,
+                forecast=fallback["forecast"],
+                trained_at=fallback["trained_at"],
+                requested_at=cached["requested_at"],
+                training_seconds=training_seconds,
+                stale=True,
+                error=cached["error"],
+                message="Forecast refresh has been queued.",
+                summary=(
                     f"Showing last saved forecast for {fallback['target_date']} "
                     f"while {normalized_target_date} trains."
                 ),
-            }
+            )
 
     status = cached["status"]
     if is_stale and status == "fresh":
         status = "stale"
     training_seconds = forecast_training_seconds(cached, now)
 
-    return {
-        "status": status,
-        "target_date": normalized_target_date,
-        "include_target_date": include_target_date,
-        "forecast": cached["forecast"],
-        "trained_at": cached["trained_at"],
-        "requested_at": cached["requested_at"],
-        "training_seconds": training_seconds,
-        "stale": is_stale,
-        "error": cached["error"],
-        "message": "Forecast refresh has been queued." if is_stale else None,
-        "summary": forecast_summary(
+    return ForecastResponse(
+        status=status,
+        target_date=normalized_target_date,
+        include_target_date=include_target_date,
+        forecast=cached["forecast"],
+        trained_at=cached["trained_at"],
+        requested_at=cached["requested_at"],
+        training_seconds=training_seconds,
+        stale=is_stale,
+        error=cached["error"],
+        message="Forecast refresh has been queued." if is_stale else None,
+        summary=forecast_summary(
             status,
             stale=is_stale,
             error=cached["error"],
             training_seconds=training_seconds,
         ),
-    }
+    )
 
 
 @app.post("/forecast/refresh")
@@ -1147,8 +1087,9 @@ async def forecast_refresh(
     background_tasks: BackgroundTasks,
     target_date: Optional[str] = Query(None),
     include_target_date: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
 ):
-    df = demand_dataframe()
+    df = await demand_dataframe(db)
     normalized_target_date = normalize_target_date(df, target_date)
     if normalized_target_date is None:
         return {
@@ -1170,8 +1111,9 @@ async def forecast_refresh(
 async def forecast_status(
     target_date: Optional[str] = Query(None),
     include_target_date: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
 ):
-    df = demand_dataframe()
+    df = await demand_dataframe(db)
     normalized_target_date = normalize_target_date(df, target_date)
     if normalized_target_date is None:
         return {
@@ -1181,7 +1123,7 @@ async def forecast_status(
         }
 
     cache_key = forecast_cache_key(normalized_target_date, include_target_date)
-    cached = get_cached_forecast(cache_key)
+    cached = await get_cached_forecast(db, cache_key)
     if cached is None:
         return {
             "status": "missing",
@@ -1208,7 +1150,8 @@ async def stream(request: Request):
                 break
 
             try:
-                rows = fetch_rows(after_id=last_id)
+                async with async_session_factory() as db:
+                    rows = await fetch_rows(db, after_id=last_id)
                 for row in rows:
                     if await request.is_disconnected():
                         return
