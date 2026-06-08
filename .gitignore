@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
+*.pyc
 *$py.class
 
 # C extensions
@@ -209,6 +210,7 @@ __pycache__/
 data.db
 data.db-shm
 data.db-wal
+.env
 sent_files.txt
 models/
 
