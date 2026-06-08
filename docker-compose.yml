@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: rtedd-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-rtedd}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-rtedd}
+      POSTGRES_DB: ${DB_NAME:-rtedd}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-rtedd}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: rtedd-server
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${DB_USER:-rtedd}:${DB_PASSWORD:-rtedd}@postgres:5432/${DB_NAME:-rtedd}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-3600}
+      MAX_REQUEST_SIZE_BYTES: ${MAX_REQUEST_SIZE_BYTES:-1048576}
+      MAX_BULK_INGEST_ROWS: ${MAX_BULK_INGEST_ROWS:-5000}
+      FORECAST_REFRESH_SECONDS: ${FORECAST_REFRESH_SECONDS:-300}
+      FORECAST_XGBOOST_N_JOBS: ${FORECAST_XGBOOST_N_JOBS:-2}
+      FORECAST_LIGHTGBM_RETRAIN_ROWS: ${FORECAST_LIGHTGBM_RETRAIN_ROWS:-168}
+      WEATHER_LATITUDE: ${WEATHER_LATITUDE:-43.6532}
+      WEATHER_LONGITUDE: ${WEATHER_LONGITUDE:-79.3832}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./models:/app/models
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: rtedd-dashboard
+    environment:
+      SERVER_IP: ${SERVER_IP:-server}
+    ports:
+      - "8501:8501"
+    depends_on:
+      - server
+
+volumes:
+  postgres_data:
