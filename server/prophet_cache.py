@@ -1,5 +1,7 @@
+import os
 import logging
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
+from typing import Optional
 
 import pandas as pd
 from sqlalchemy import select
@@ -15,7 +17,7 @@ async def get_prophet_components_from_db(
     db: AsyncSession,
     start_ts: datetime,
     end_ts: datetime,
-) -> pd.DataFrame | None:
+) -> Optional[pd.DataFrame]:
     """
     Retrieve cached prophet components from database for a timestamp range.
     
@@ -113,7 +115,7 @@ async def fit_and_cache_prophet_components(
     components_to_cache = []
     
     for component_type in component_cols:
-        for idx, row in components.iterrows():
+        for _, row in components.iterrows():
             ts = pd.to_datetime(row["ds"])
             value = float(row.get(component_type.replace("prophet_", ""), 0.0))
             
@@ -137,10 +139,10 @@ async def fit_and_cache_prophet_components(
     component_df = pd.DataFrame(
         {
             "Timestamp": pd.to_datetime(prophet_df["ds"]).values,
-            "prophet_trend": components.get("trend", 0.0).values,
-            "prophet_yearly": components.get("yearly", 0.0).values,
-            "prophet_weekly": components.get("weekly", 0.0).values,
-            "prophet_daily": components.get("daily", 0.0).values,
+            "prophet_trend": components["trend"].values if "trend" in components.columns else 0.0,
+            "prophet_yearly": components["yearly"].values if "yearly" in components.columns else 0.0,
+            "prophet_weekly": components["weekly"].values if "weekly" in components.columns else 0.0,
+            "prophet_daily": components["daily"].values if "daily" in components.columns else 0.0,
         }
     )
     
@@ -163,7 +165,6 @@ async def are_prophet_components_stale(
     - Data extends beyond cached range
     - Row count has increased by PROPHET_CACHE_STALE_ROWS or more
     """
-    import os
     PROPHET_CACHE_STALE_ROWS = int(os.getenv("PROPHET_CACHE_STALE_ROWS", "168"))
     
     if df.empty:
@@ -184,11 +185,11 @@ async def are_prophet_components_stale(
         return True
     
     # Check if data extends beyond cache
-    if ts_min < pd.Timestamp(cached.train_start_date, tz=timezone.utc):
+    if ts_min < pd.Timestamp(cached.train_start_date):
         logger.info("Data extends before cached range, components are stale")
         return True
     
-    if ts_max > pd.Timestamp(cached.train_end_date, tz=timezone.utc):
+    if ts_max > pd.Timestamp(cached.train_end_date):
         logger.info("Data extends after cached range, components are stale")
         return True
     
