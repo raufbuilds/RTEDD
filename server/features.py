@@ -161,6 +161,11 @@ def engineer_features(df):
             nan_counts.to_dict(),
         )
 
+    return df
+
+
+def prepare_training_features(df):
+    """Drop rows with NaN values in critical feature columns."""
     before = len(df)
     df = df.dropna(subset=CRITICAL_FEATURE_COLUMNS)
     dropped = before - len(df)
@@ -170,7 +175,6 @@ def engineer_features(df):
             dropped,
             CRITICAL_FEATURE_COLUMNS,
         )
-
     return df
 
 
