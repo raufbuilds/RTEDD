@@ -6,13 +6,14 @@ import os
 from typing import Any, Optional, cast
 
 import pandas as pd
+from contextlib import asynccontextmanager
 from fastapi import BackgroundTasks, Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from server.database import async_session_factory, engine, get_db
+from server.database import async_session_factory, get_db
 from server.models import Demand, ForecastCache, Weather
 from server.prophet_cache import add_prophet_components_cached
 from server.schemas import (
@@ -24,8 +25,11 @@ from server.schemas import (
     IngestResponse,
 )
 
-app = FastAPI()
 logger = logging.getLogger(__name__)
+
+
+class RequestBodyTooLarge(Exception):
+    pass
 
 
 class RequestSizeLimitMiddleware:
@@ -67,7 +71,7 @@ class RequestSizeLimitMiddleware:
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > self.max_size:
-                    raise RequestBodyTooLarge
+                    raise RequestBodyTooLarge()
             return message
 
         try:
@@ -78,10 +82,6 @@ class RequestSizeLimitMiddleware:
                 content={"detail": "Request body too large"},
             )
             await response(scope, receive, send)
-
-
-class RequestBodyTooLarge(Exception):
-    pass
 
 
 def load_env_file(path=".env"):
@@ -104,21 +104,25 @@ MAX_BULK_INGEST_ROWS = int(os.getenv("MAX_BULK_INGEST_ROWS", "5000"))
 FORECAST_REFRESH_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))
 FORECAST_XGBOOST_N_JOBS = int(os.getenv("FORECAST_XGBOOST_N_JOBS", "2"))
 FORECAST_LIGHTGBM_RETRAIN_ROWS = int(os.getenv("FORECAST_LIGHTGBM_RETRAIN_ROWS", "168"))
+PROPHET_CACHE_STALE_ROWS = int(os.getenv("PROPHET_CACHE_STALE_ROWS", "168"))
 WEATHER_LATITUDE = float(os.getenv("WEATHER_LATITUDE", "43.6532"))
 WEATHER_LONGITUDE = float(os.getenv("WEATHER_LONGITUDE", "-79.3832"))
 
 forecast_training_lock = asyncio.Lock()
 forecast_training_keys: set[str] = set()
-app.add_middleware(RequestSizeLimitMiddleware, max_size=MAX_REQUEST_SIZE_BYTES)
 
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     logger.info("RTEDD server starting up")
     # Verify database connection
     async with async_session_factory() as db:
         await db.execute(text("SELECT 1"))
     logger.info("Database connection verified")
+    yield
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(RequestSizeLimitMiddleware, max_size=MAX_REQUEST_SIZE_BYTES)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -333,7 +337,7 @@ def forecast_cache_signature(df, target_date=None, include_target_date=False):
     )
 
 
-async def forecast_with_prophet(db: AsyncSession, df, target_date=None):
+async def forecast_with_prophet(db: AsyncSession, df):
     """Generate prophet forecast using cached components instead of fitting new model."""
     if df.empty or len(df) < 24:
         return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
@@ -388,9 +392,7 @@ def save_model_train_rows(model_path, train_rows):
         pass
 
 
-async def forecast_with_xgboost(db: AsyncSession, df, target_date=None):
-    import os
-
+async def forecast_with_xgboost(db: AsyncSession, df):
     import joblib
     try:
         import lightgbm as lgb
@@ -477,8 +479,8 @@ async def forecast_with_xgboost(db: AsyncSession, df, target_date=None):
 
 async def compute_ensemble_forecast(db: AsyncSession, df, target_date=None, include_target_date=False):
     training_df = forecast_training_frame(df, target_date, include_target_date)
-    prophet_forecast = await forecast_with_prophet(db, training_df, target_date)
-    xgboost_forecast = await forecast_with_xgboost(db, training_df, target_date)
+    prophet_forecast = await forecast_with_prophet(db, training_df)
+    xgboost_forecast = await forecast_with_xgboost(db, training_df)
 
     forecast_columns = [
         "Hour",
@@ -597,7 +599,12 @@ def forecast_training_seconds(cached, now=None):
     if end_time is None:
         end_time = datetime.now(timezone.utc).timestamp()
 
-    return max(0.0, epoch_seconds(end_time) - epoch_seconds(cached["requested_at"]))
+    end_time_epoch = epoch_seconds(end_time)
+    requested_at_epoch = epoch_seconds(cached["requested_at"])
+    if end_time_epoch is None or requested_at_epoch is None:
+        return None
+
+    return max(0.0, end_time_epoch - requested_at_epoch)
 
 
 def forecast_summary(status, stale=False, error=None, training_seconds=None):
@@ -888,7 +895,7 @@ async def weather_backfill(
             statement.on_conflict_do_update(index_elements=["date", "hour"], set_=update_values)
         )
         await db.commit()
-        saved = result.rowcount or len(rows)
+        saved = getattr(result, "rowcount", 0) or len(rows)
 
     return {
         "status": "saved",
@@ -962,7 +969,7 @@ async def forecast_latest(
         if fallback is not None and fallback.get("forecast"):
             return ForecastResponse(
                 status="training",
-                target_date=normalized_target_date,
+                target_date=pd.Timestamp(normalized_target_date).date() if normalized_target_date else None,
                 include_target_date=include_target_date,
                 forecast=fallback["forecast"],
                 trained_at=fallback["trained_at"],
@@ -978,7 +985,7 @@ async def forecast_latest(
             )
         return ForecastResponse(
             status="training",
-            target_date=normalized_target_date,
+            target_date=pd.Timestamp(normalized_target_date).date() if normalized_target_date else None,
             include_target_date=include_target_date,
             forecast=[],
             trained_at=None,
@@ -995,7 +1002,7 @@ async def forecast_latest(
             training_seconds = forecast_training_seconds(cached, now)
             return ForecastResponse(
                 status=cached["status"],
-                target_date=normalized_target_date,
+                target_date=pd.Timestamp(normalized_target_date).date() if normalized_target_date else None,
                 include_target_date=include_target_date,
                 forecast=fallback["forecast"],
                 trained_at=fallback["trained_at"],
@@ -1017,7 +1024,7 @@ async def forecast_latest(
 
     return ForecastResponse(
         status=status,
-        target_date=normalized_target_date,
+        target_date=pd.Timestamp(normalized_target_date).date() if normalized_target_date else None,
         include_target_date=include_target_date,
         forecast=cached["forecast"],
         trained_at=cached["trained_at"],
