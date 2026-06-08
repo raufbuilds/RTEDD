@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
-import threading
 from typing import Any, Optional, cast
 
 import pandas as pd
@@ -107,9 +106,18 @@ FORECAST_LIGHTGBM_RETRAIN_ROWS = int(os.getenv("FORECAST_LIGHTGBM_RETRAIN_ROWS",
 WEATHER_LATITUDE = float(os.getenv("WEATHER_LATITUDE", "43.6532"))
 WEATHER_LONGITUDE = float(os.getenv("WEATHER_LONGITUDE", "-79.3832"))
 
-forecast_training_lock = threading.Lock()
+forecast_training_lock = asyncio.Lock()
 forecast_training_keys: set[str] = set()
 app.add_middleware(RequestSizeLimitMiddleware, max_size=MAX_REQUEST_SIZE_BYTES)
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("RTEDD server starting up")
+    # Verify database connection
+    async with async_session_factory() as db:
+        await db.execute(text("SELECT 1"))
+    logger.info("Database connection verified")
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -445,9 +453,9 @@ def forecast_with_xgboost(df, target_date=None):
     except ImportError:
         return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
     try:
-        from server.features import engineer_features, get_feature_cols
+        from server.features import engineer_features, get_feature_cols, prepare_training_features
     except ImportError:
-        from features import engineer_features, get_feature_cols
+        from features import engineer_features, get_feature_cols, prepare_training_features
 
     columns = ["Hour", "XGBoost Predicted", "XGBoost_P10", "XGBoost_P50", "XGBoost_P90"]
     MODEL_DIR = "models"
@@ -458,6 +466,7 @@ def forecast_with_xgboost(df, target_date=None):
 
     df_with_prophet = add_prophet_components(df)
     df_feat = engineer_features(df_with_prophet)
+    df_feat = prepare_training_features(df_feat)
     feature_cols = get_feature_cols(df_feat)
 
     last_timestamp = pd.Timestamp(df_feat.iloc[-1]["Timestamp"])
@@ -763,17 +772,17 @@ async def refresh_forecast_cache(target_date: str, include_target_date: bool):
                 str(exc),
             )
         finally:
-            with forecast_training_lock:
+            async with forecast_training_lock:
                 forecast_training_keys.discard(cache_key)
 
 
-def schedule_forecast_refresh(
+async def schedule_forecast_refresh(
     background_tasks: BackgroundTasks,
     target_date: str,
     include_target_date: bool,
 ):
     cache_key = forecast_cache_key(target_date, include_target_date)
-    with forecast_training_lock:
+    async with forecast_training_lock:
         if cache_key in forecast_training_keys:
             return
         forecast_training_keys.add(cache_key)
@@ -1002,7 +1011,7 @@ async def forecast_latest(
     )
 
     if is_missing or is_stale or (cached and cached.get("status") == "failed"):
-        schedule_forecast_refresh(background_tasks, normalized_target_date, include_target_date)
+        await schedule_forecast_refresh(background_tasks, normalized_target_date, include_target_date)
 
     if cached is None:
         fallback = await get_latest_fresh_forecast(db, include_target_date)
@@ -1099,7 +1108,7 @@ async def forecast_refresh(
             "message": "No demand records are available.",
         }
 
-    schedule_forecast_refresh(background_tasks, normalized_target_date, include_target_date)
+    await schedule_forecast_refresh(background_tasks, normalized_target_date, include_target_date)
     return {
         "status": "queued",
         "target_date": normalized_target_date,
