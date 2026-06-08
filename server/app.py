@@ -333,38 +333,30 @@ def forecast_cache_signature(df, target_date=None, include_target_date=False):
     )
 
 
-def forecast_with_prophet(df, target_date=None):
+async def forecast_with_prophet(db: AsyncSession, df, target_date=None):
+    """Generate prophet forecast using cached components instead of fitting new model."""
     if df.empty or len(df) < 24:
         return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
 
-    from prophet import Prophet
-
-    prophet_df = df[["Timestamp", "Ontario Demand"]].copy()
-    prophet_df = prophet_df.dropna()
-    prophet_df = prophet_df.rename(columns={"Timestamp": "ds", "Ontario Demand": "y"})
-
-    if len(prophet_df) < 24:
+    # Get prophet components from cache
+    df_with_components = await add_prophet_components_cached(db, df)
+    
+    # Extract last 24 rows and aggregate components
+    last_24 = df_with_components.tail(24).copy()
+    
+    if len(last_24) < 24:
         return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
-
-    model = Prophet(
-        daily_seasonality="auto",
-        weekly_seasonality="auto",
-        yearly_seasonality="auto",
-        changepoint_prior_scale=0.05,
+    
+    # Combine all prophet components for the prediction
+    prophet_columns = ["prophet_trend", "prophet_yearly", "prophet_weekly", "prophet_daily"]
+    last_24["Prophet Predicted"] = sum(
+        last_24.get(col, 0.0) for col in prophet_columns
     )
-    model.fit(prophet_df)
-
-    if target_date is None:
-        target_date = df["Date"].max()
-
-    future_df = pd.DataFrame(
-        {"ds": [pd.Timestamp(target_date).replace(hour=hour) for hour in range(24)]}
-    )
-    forecast = model.predict(future_df)
+    
     return pd.DataFrame(
         {
             "Hour": range(24),
-            "Prophet Predicted": forecast["yhat"].values,
+            "Prophet Predicted": last_24["Prophet Predicted"].values,
         }
     )
 
@@ -485,7 +477,7 @@ async def forecast_with_xgboost(db: AsyncSession, df, target_date=None):
 
 async def compute_ensemble_forecast(db: AsyncSession, df, target_date=None, include_target_date=False):
     training_df = forecast_training_frame(df, target_date, include_target_date)
-    prophet_forecast = forecast_with_prophet(training_df, target_date)
+    prophet_forecast = await forecast_with_prophet(db, training_df, target_date)
     xgboost_forecast = await forecast_with_xgboost(db, training_df, target_date)
 
     forecast_columns = [
