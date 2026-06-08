@@ -1,5 +1,0 @@
-PUB_Demand_2020.P.csv
-PUB_Demand_2021.P.csv
-PUB_Demand_2022.P.csv
-PUB_Demand_2023.P.csv
-PUB_Demand_2024.P.csv
