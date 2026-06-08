@@ -1,6 +1,12 @@
+import logging
+
 from holidays import country_holidays
 import numpy as np
 import pandas as pd
+
+
+logger = logging.getLogger(__name__)
+CRITICAL_FEATURE_COLUMNS = ["Ontario Demand", "hour_sin", "hour_cos", "dow_sin", "dow_cos"]
 
 
 def _feature_years(timestamp):
@@ -144,7 +150,28 @@ def engineer_features(df):
             df[column] = 0.0
         df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
 
-    return df.dropna()
+    nan_counts = df.isna().sum()
+    nan_counts = nan_counts[nan_counts > 0].sort_values(ascending=False)
+    if not nan_counts.empty:
+        affected_rows = int(df[nan_counts.index].isna().any(axis=1).sum())
+        logger.warning(
+            "Feature engineering produced NaN values in %s columns affecting %s rows: %s",
+            len(nan_counts),
+            affected_rows,
+            nan_counts.to_dict(),
+        )
+
+    before = len(df)
+    df = df.dropna(subset=CRITICAL_FEATURE_COLUMNS)
+    dropped = before - len(df)
+    if dropped:
+        logger.warning(
+            "Dropped %s rows with NaN in critical feature columns: %s",
+            dropped,
+            CRITICAL_FEATURE_COLUMNS,
+        )
+
+    return df
 
 
 def get_feature_cols(df):
