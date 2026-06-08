@@ -161,8 +161,11 @@ async def are_prophet_components_stale(
     Considers components stale if:
     - No cached components exist
     - Data extends beyond cached range
-    - Row count has increased significantly
+    - Row count has increased by PROPHET_CACHE_STALE_ROWS or more
     """
+    import os
+    PROPHET_CACHE_STALE_ROWS = int(os.getenv("PROPHET_CACHE_STALE_ROWS", "168"))
+    
     if df.empty:
         return True
     
@@ -189,12 +192,13 @@ async def are_prophet_components_stale(
         logger.info("Data extends after cached range, components are stale")
         return True
     
-    # Check if row count increased significantly (more than 10%)
-    if current_row_count > cached.train_row_count * 1.1:
+    # Check if row count increased by threshold or more
+    stale_rows = current_row_count - cached.train_row_count
+    if stale_rows >= PROPHET_CACHE_STALE_ROWS:
         logger.info(
-            "Row count increased significantly (%d -> %d), components are stale",
-            cached.train_row_count,
-            current_row_count,
+            "Row count increased by %d rows (threshold: %d), components are stale",
+            stale_rows,
+            PROPHET_CACHE_STALE_ROWS,
         )
         return True
     
