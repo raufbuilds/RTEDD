@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.database import async_session_factory, engine, get_db
 from server.models import Demand, ForecastCache, Weather
+from server.prophet_cache import add_prophet_components_cached
 from server.schemas import (
     ForecastResponse,
     HealthResponse,
@@ -368,55 +369,6 @@ def forecast_with_prophet(df, target_date=None):
     )
 
 
-def add_prophet_components(df):
-    component_cols = ["prophet_trend", "prophet_yearly", "prophet_weekly", "prophet_daily"]
-    if df.empty or len(df) < 24:
-        result = df.copy()
-        for column in component_cols:
-            result[column] = 0.0
-        return result
-
-    try:
-        from prophet import Prophet
-    except ImportError:
-        result = df.copy()
-        for column in component_cols:
-            result[column] = 0.0
-        return result
-
-    prophet_df = df[["Timestamp", "Ontario Demand"]].copy()
-    prophet_df = prophet_df.dropna()
-    prophet_df = prophet_df.rename(columns={"Timestamp": "ds", "Ontario Demand": "y"})
-    if len(prophet_df) < 24:
-        result = df.copy()
-        for column in component_cols:
-            result[column] = 0.0
-        return result
-
-    model = Prophet(
-        daily_seasonality="auto",
-        weekly_seasonality="auto",
-        yearly_seasonality="auto",
-        changepoint_prior_scale=0.05,
-    )
-    model.fit(prophet_df)
-    components = model.predict(prophet_df[["ds"]])
-    component_df = pd.DataFrame(
-        {
-            "Timestamp": pd.to_datetime(prophet_df["ds"]).values,
-            "prophet_trend": components.get("trend", 0.0),
-            "prophet_yearly": components.get("yearly", 0.0),
-            "prophet_weekly": components.get("weekly", 0.0),
-            "prophet_daily": components.get("daily", 0.0),
-        }
-    )
-
-    result = pd.merge(df.copy(), component_df, on="Timestamp", how="left")
-    for column in component_cols:
-        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
-    return result
-
-
 def get_model_metadata_path(model_path):
     """Get the metadata file path for a model."""
     return model_path.replace(".pkl", ".meta.json")
@@ -444,7 +396,7 @@ def save_model_train_rows(model_path, train_rows):
         pass
 
 
-def forecast_with_xgboost(df, target_date=None):
+async def forecast_with_xgboost(db: AsyncSession, df, target_date=None):
     import os
 
     import joblib
@@ -464,7 +416,7 @@ def forecast_with_xgboost(df, target_date=None):
     if len(df) < 500:
         return pd.DataFrame(columns=columns)
 
-    df_with_prophet = add_prophet_components(df)
+    df_with_prophet = await add_prophet_components_cached(db, df)
     df_feat = engineer_features(df_with_prophet)
     df_feat = prepare_training_features(df_feat)
     feature_cols = get_feature_cols(df_feat)
@@ -531,10 +483,10 @@ def forecast_with_xgboost(df, target_date=None):
     return pd.DataFrame(predictions, columns=columns)
 
 
-def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
+async def compute_ensemble_forecast(db: AsyncSession, df, target_date=None, include_target_date=False):
     training_df = forecast_training_frame(df, target_date, include_target_date)
     prophet_forecast = forecast_with_prophet(training_df, target_date)
-    xgboost_forecast = forecast_with_xgboost(training_df, target_date)
+    xgboost_forecast = await forecast_with_xgboost(db, training_df, target_date)
 
     forecast_columns = [
         "Hour",
@@ -757,7 +709,7 @@ async def refresh_forecast_cache(target_date: str, include_target_date: bool):
 
             training_df = forecast_training_frame(df, target_date, include_target_date)
             signature = forecast_cache_signature(training_df, target_date, include_target_date)
-            result = compute_ensemble_forecast(df, target_date, include_target_date)
+            result = await compute_ensemble_forecast(db, df, target_date, include_target_date)
             await save_forecast_cache(db, cache_key, target_date, include_target_date, signature, result, "fresh")
         except Exception as exc:
             logger.exception("Forecast refresh failed")
