@@ -9,8 +9,32 @@ import requests
 import streamlit as st
 
 
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+load_env_file(os.path.join(PROJECT_ROOT, ".env"))
+load_env_file()
+
 SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
-BASE_URL = f"http://{SERVER_IP}:8000"
+API_PORT = os.getenv("API_PORT", "8000")
+DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
+configured_base_url = os.getenv("API_BASE_URL")
+if configured_base_url and not (configured_base_url == DEFAULT_API_BASE_URL and API_PORT != "8000"):
+    BASE_URL = configured_base_url
+else:
+    BASE_URL = f"http://{SERVER_IP}:{API_PORT}"
 RECORD_COUNT_URL = f"{BASE_URL}/records/count"
 DASHBOARD_DATA_URL = f"{BASE_URL}/dashboard/data"
 FORECAST_URL = f"{BASE_URL}/forecast/latest"
