@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableDelayedExpansion
+setlocal
 :: Set script to run from the folder it is located in
 cd /D "%~dp0"
 
@@ -14,30 +14,40 @@ if not exist "venv\Scripts\activate.bat" (
 :: 2. Activate VENV using double quotes to handle spaces in path (e.g., "IT BD")
 call "venv\Scripts\activate.bat"
 
-:: 3. Check port 8000 before starting FastAPI.
-echo Checking port 8000...
-set "PORT_PIDS="
-for /f "tokens=5" %%a in ('netstat -aon ^| findstr /r /c:":8000 .*LISTENING"') do (
-    set "PORT_PIDS=!PORT_PIDS! %%a"
+:: 3. Load API_PORT from .env, defaulting to 8000.
+set "API_PORT=8000"
+if exist ".env" (
+    for /f "usebackq tokens=1,* delims==" %%a in (".env") do (
+        if /i "%%a"=="API_PORT" set "API_PORT=%%b"
+    )
 )
+set "API_PORT=%API_PORT: =%"
+set "API_PORT=%API_PORT:"=%"
+
+:: 4. Check the configured port before starting FastAPI.
+echo Checking port %API_PORT%...
+set "PORT_PIDS="
+set "PORT_FILE=%TEMP%\pub_port_pids.txt"
+powershell -NoLogo -NoProfile -Command "Try { (Get-NetTCPConnection -LocalPort %API_PORT% -State Listen -ErrorAction SilentlyContinue | Select-Object -Expand OwningProcess) -join ' ' } Catch { }" > "%PORT_FILE%"
+if exist "%PORT_FILE%" set /p PORT_PIDS=<"%PORT_FILE%"
+del "%PORT_FILE%" 2>nul
 
 if defined PORT_PIDS (
-    echo Port 8000 is already in use by PID(s):!PORT_PIDS!
-    choice /m "Stop these process(es) so FastAPI can start"
+    echo Port %API_PORT% is already in use by PIDs:%PORT_PIDS%
+    choice /m "Stop these processes so FastAPI can start"
     if errorlevel 2 (
-        echo FastAPI startup cancelled. Free port 8000 and run this script again.
+        echo FastAPI startup cancelled. Free port %API_PORT% and run this script again.
         pause
         exit /b 1
     )
-    for %%a in (!PORT_PIDS!) do (
+    for %%a in (%PORT_PIDS%) do (
         taskkill /f /pid %%a >nul 2>&1
     )
 )
 
 echo Starting FastAPI server...
 :: Reload only when server code changes. Dashboard edits should not restart the API.
-start "FASTAPI" cmd /k "uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload --reload-dir server"
-
+start "FASTAPI" cmd /k "uvicorn server.app:app --host 0.0.0.0 --port %API_PORT% --reload --reload-dir server"
 
 echo Starting sender...
 start "SENDER" cmd /k "python client/sender.py"
