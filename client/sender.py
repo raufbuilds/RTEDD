@@ -23,7 +23,13 @@ def load_env_file(path=".env"):
 
 load_env_file()
 
-BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+API_PORT = os.getenv("API_PORT", "8000")
+DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
+configured_base_url = os.getenv("API_BASE_URL")
+if configured_base_url and not (configured_base_url == DEFAULT_API_BASE_URL and API_PORT != "8000"):
+    BASE_URL = configured_base_url
+else:
+    BASE_URL = f"http://127.0.0.1:{API_PORT}"
 API_URL = f"{BASE_URL}/ingest"
 BULK_API_URL = f"{BASE_URL}/ingest/bulk"
 LATEST_URL = f"{BASE_URL}/latest"
