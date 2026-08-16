@@ -1,10 +1,13 @@
 import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, Float, Index, Integer, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, Float, Index, Integer, JSON, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from server.database import Base
+
+
+JsonType = JSONB().with_variant(JSON(), "sqlite")
 
 
 class Demand(Base):
@@ -38,8 +41,8 @@ class ForecastCache(Base):
         nullable=False,
         server_default="false",
     )
-    signature: Mapped[object | None] = mapped_column(JSONB)
-    result_json: Mapped[object | None] = mapped_column(JSONB)
+    signature: Mapped[object | None] = mapped_column(JsonType)
+    result_json: Mapped[object | None] = mapped_column(JsonType)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="training")
     error: Mapped[str | None] = mapped_column(Text)
     trained_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
