@@ -10,7 +10,8 @@ import streamlit as st
 
 
 SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
-BASE_URL = f"http://{SERVER_IP}:8000"
+API_PORT = os.getenv("API_PORT", "8000")
+BASE_URL = os.getenv("API_BASE_URL", f"http://{SERVER_IP}:{API_PORT}")
 RECORD_COUNT_URL = f"{BASE_URL}/records/count"
 DASHBOARD_DATA_URL = f"{BASE_URL}/dashboard/data"
 FORECAST_URL = f"{BASE_URL}/forecast/latest"
