@@ -1,11 +1,11 @@
-from datetime import date
+from datetime import date as DateType
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class IngestRecord(BaseModel):
-    date: date = Field(alias="Date")
+    date: DateType = Field(alias="Date")
     hour: int = Field(alias="Hour", ge=0, le=23)
     demand: float = Field(alias="Ontario Demand")
 
@@ -33,7 +33,7 @@ class IngestBulkResponse(BaseModel):
 
 class ForecastResponse(BaseModel):
     status: str
-    target_date: date | None
+    target_date: DateType | None
     include_target_date: bool
     forecast: list[dict[str, Any]] = Field(default_factory=list)
     trained_at: float | None = None
@@ -52,7 +52,7 @@ class HealthResponse(BaseModel):
 
 class ForecastCacheRow(BaseModel):
     cache_key: str
-    target_date: date
+    target_date: DateType
     include_target_date: bool
     signature: Any = None
     forecast: list[dict[str, Any]] = Field(default_factory=list)
