@@ -11,9 +11,10 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from server.database import async_session_factory, get_db
+from server.database import Base, DATABASE_URL, async_session_factory, engine, get_db
 from server.models import Demand, ForecastCache, Weather
 from server.prophet_cache import add_prophet_components_cached
 from server.schemas import (
@@ -115,7 +116,10 @@ forecast_training_keys: set[str] = set()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("RTEDD server starting up")
-    # Verify database connection
+    if DATABASE_URL.startswith("sqlite"):
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
     async with async_session_factory() as db:
         await db.execute(text("SELECT 1"))
     logger.info("Database connection verified")
@@ -125,10 +129,17 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(RequestSizeLimitMiddleware, max_size=MAX_REQUEST_SIZE_BYTES)
 
 
+def dialect_insert(db: AsyncSession, table):
+    bind = db.get_bind()
+    if bind.dialect.name == "sqlite":
+        return sqlite_insert(table)
+    return pg_insert(table)
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health(db: AsyncSession = Depends(get_db)):
     await db.execute(text("SELECT 1"))
-    return HealthResponse(status="ok", database="postgresql")
+    return HealthResponse(status="ok", database=db.get_bind().dialect.name)
 
 
 async def fetch_rows(db: AsyncSession, after_id: int = 0, limit: Optional[int] = None):
@@ -637,7 +648,7 @@ async def save_forecast_cache(
 ):
     result_json = json.loads(result.to_json(orient="records")) if result is not None else None
     now = datetime.now(timezone.utc)
-    statement = pg_insert(ForecastCache).values(
+    statement = dialect_insert(db, ForecastCache).values(
         cache_key=cache_key,
         target_date=pd.Timestamp(target_date).date(),
         include_target_date=include_target_date,
@@ -670,7 +681,7 @@ async def mark_forecast_requested(
     status: str,
 ):
     now = datetime.now(timezone.utc)
-    statement = pg_insert(ForecastCache).values(
+    statement = dialect_insert(db, ForecastCache).values(
         cache_key=cache_key,
         target_date=pd.Timestamp(target_date).date(),
         include_target_date=include_target_date,
@@ -744,7 +755,7 @@ async def schedule_forecast_refresh(
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(record: IngestRecord, db: AsyncSession = Depends(get_db)):
     statement = (
-        pg_insert(Demand)
+        dialect_insert(db, Demand)
         .values(date=record.date, hour=record.hour, demand=record.demand)
         .on_conflict_do_nothing(index_elements=["date", "hour"])
         .returning(Demand.id)
@@ -784,7 +795,7 @@ async def ingest_bulk(data: IngestBulkRequest, db: AsyncSession = Depends(get_db
     saved = 0
     if values:
         statement = (
-            pg_insert(Demand)
+            dialect_insert(db, Demand)
             .values(values)
             .on_conflict_do_nothing(index_elements=["date", "hour"])
             .returning(Demand.id)
@@ -823,9 +834,8 @@ async def records(
 
 
 @app.get("/records/count")
-async def records_count():
-    async with async_session_factory() as db:
-        return {"total_records": await fetch_record_count(db)}
+async def records_count(db: AsyncSession = Depends(get_db)):
+    return {"total_records": await fetch_record_count(db)}
 
 
 @app.get("/dashboard/data")
@@ -870,7 +880,7 @@ async def weather_backfill(
     rows = weather_df.to_dict(orient="records")
     saved = 0
     if rows:
-        statement = pg_insert(Weather).values(
+        statement = dialect_insert(db, Weather).values(
             [
                 {
                     "date": pd.Timestamp(row["date"]).date(),
