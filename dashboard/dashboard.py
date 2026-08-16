@@ -13,11 +13,8 @@ SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
 BASE_URL = f"http://{SERVER_IP}:8000"
 RECORD_COUNT_URL = f"{BASE_URL}/records/count"
 DASHBOARD_DATA_URL = f"{BASE_URL}/dashboard/data"
-FORECAST_URL = f"{BASE_URL}/forecast/latest"
-FORECAST_REFRESH_URL = f"{BASE_URL}/forecast/refresh"
+METRICS_2025_URL = f"{BASE_URL}/forecast/2025-metrics"
 HOURS = list(range(24))
-FORECAST_POLL_SECONDS = 15
-FORECAST_FRESH_POLL_SECONDS = 60
 
 
 st.set_page_config(
@@ -45,6 +42,19 @@ st.markdown(
 
 st.title("Real-Time Electricity Demand Dashboard")
 st.caption(f"Connected to {BASE_URL}")
+
+
+def show_2025_test_data_warning(df):
+    """Show a warning if 2025 data is present, indicating test mode."""
+    if df.empty:
+        return
+    
+    if df["Date"].dt.year.max() >= 2025 and df["Date"].dt.year.min() <= 2024:
+        st.warning(
+            "⚠️ **TEST MODE ACTIVE**: 2025 is configured as test data. "
+            "Forecast models are trained only on 2020-2024 data. "
+            "Use the 'Forecast Training Comparison' view to evaluate performance against 2025 actual demand."
+        )
 
 
 def ensure_state():
@@ -359,7 +369,7 @@ def forecast_status_text():
 
 def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
     """
-    Fetch the latest cached Prophet/XGBoost ensemble forecast from FastAPI.
+    Fetch the latest cached Prophet/LightGBM ensemble forecast from FastAPI.
     """
     return fetch_cached_forecast(target_date, include_target_date)
 
@@ -855,6 +865,162 @@ def calculate_accuracy_percentage(actual, predicted):
     return max(0.0, min(100.0, float(accuracy)))
 
 
+def calculate_error_metrics(actual, predicted):
+    comparison = pd.DataFrame({"Actual": actual, "Predicted": predicted}).dropna()
+    if comparison.empty:
+        return None
+
+    error = comparison["Actual"] - comparison["Predicted"]
+    mae = error.abs().mean()
+    rmse = (error.pow(2).mean()) ** 0.5
+    nonzero = comparison[comparison["Actual"] != 0]
+    mape = None
+    if not nonzero.empty:
+        mape = ((nonzero["Actual"] - nonzero["Predicted"]).abs() / nonzero["Actual"].abs()).mean() * 100
+
+    return {
+        "MAE (MW)": float(mae),
+        "RMSE (MW)": float(rmse),
+        "MAPE %": None if mape is None else float(mape),
+        "Compared Hours": len(comparison),
+    }
+
+
+def fetch_2025_metrics():
+    """Fetch 2025 test data metrics from the server."""
+    try:
+        response = requests.get(METRICS_2025_URL, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        st.error(f"Failed to fetch 2025 metrics: {exc}")
+        return None
+
+
+def render_2025_metrics():
+    """Render the 2025 test data metrics panel."""
+    st.subheader("📊 2025 Test Data: Forecast Accuracy Metrics")
+    
+    metrics_data = fetch_2025_metrics()
+    
+    if metrics_data is None:
+        st.info("Unable to fetch 2025 metrics")
+        return
+    
+    if not metrics_data.get("available"):
+        st.warning(f"⚠️ {metrics_data.get('message', 'No 2025 data available')}")
+        return
+    
+    # Display key metrics as cards
+    col1, col2, col3 = st.columns(3)
+    
+    metrics_info = metrics_data.get("metrics", {})
+    mae = metrics_info.get("MAE", None)
+    mape = metrics_info.get("MAPE", None)
+    rmse = metrics_info.get("RMSE", None)
+    
+    with col1:
+        if mae is not None:
+            st.metric("Mean Absolute Error (MAE)", f"{mae:.2f} MW")
+        else:
+            st.metric("Mean Absolute Error (MAE)", "—")
+    
+    with col2:
+        if mape is not None:
+            st.metric("Mean Absolute % Error (MAPE)", f"{mape:.2f}%")
+        else:
+            st.metric("Mean Absolute % Error (MAPE)", "—")
+    
+    with col3:
+        if rmse is not None:
+            st.metric("Root Mean Squared Error (RMSE)", f"{rmse:.2f} MW")
+        else:
+            st.metric("Root Mean Squared Error (RMSE)", "—")
+    
+    # Display status and data info
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.metric("2025 Records", f"{metrics_data.get('total_records', 0)}")
+    with col_b:
+        st.metric("Forecast Records Matched", f"{metrics_data.get('forecast_records', 0)}")
+    
+    # Display hourly errors table if available
+    hourly_errors = metrics_data.get("hourly_errors", {})
+    if hourly_errors:
+        st.subheader("Hourly Error Breakdown")
+        hourly_df = pd.DataFrame([
+            {
+                "Hour": int(hour.replace("H", "")),
+                "Mean Error (MW)": v.get("mean_error", 0),
+                "MAE (MW)": v.get("mae", 0),
+                "MAPE (%)": v.get("mape", 0),
+                "Count": v.get("count", 0),
+            }
+            for hour, v in sorted(hourly_errors.items())
+        ])
+        hourly_df = hourly_df.sort_values("Hour")
+        st.dataframe(hourly_df.round(2), use_container_width=True, hide_index=True)
+    
+    # Display status info
+    st.caption(
+        f"Forecast status: {metrics_data.get('forecast_status', 'unknown')} | "
+        f"Last trained: {metrics_data.get('forecast_trained_at', 'N/A')}"
+    )
+
+
+def render_forecast_status_panel():
+    """Render a compact forecast training status panel."""
+    st.subheader("⚡ Forecast Status")
+    
+    if st.session_state.forecast_status is None:
+        st.info("Forecast status: initializing...")
+        return
+    
+    # Status colors and icons
+    status_info = {
+        "fresh": ("✅ Fresh", "success"),
+        "stale": ("🔄 Stale (refreshing)", "warning"),
+        "training": ("🔨 Training", "info"),
+        "failed": ("❌ Failed", "error"),
+        "empty": ("⏸️ Empty", "warning"),
+        "missing": ("❓ Missing", "warning"),
+    }
+    
+    status_display, status_type = status_info.get(
+        st.session_state.forecast_status,
+        ("❓ Unknown", "warning")
+    )
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if status_type == "success":
+            st.success(status_display)
+        elif status_type == "warning":
+            st.warning(status_display)
+        elif status_type == "error":
+            st.error(status_display)
+        else:
+            st.info(status_display)
+    
+    with col2:
+        if st.session_state.forecast_trained_at:
+            age_s = time.time() - float(st.session_state.forecast_trained_at)
+            st.metric("Age", f"{age_s/60:.1f} min" if age_s >= 60 else f"{age_s:.0f}s")
+        else:
+            st.metric("Age", "—")
+    
+    with col3:
+        if st.session_state.forecast_training_seconds is not None:
+            st.metric("Last Training", f"{st.session_state.forecast_training_seconds:.1f}s")
+        else:
+            st.metric("Last Training", "—")
+    
+    # Display message if available
+    if st.session_state.forecast_message:
+        st.caption(st.session_state.forecast_message)
+
+
 def style_today_trace(fig):
     for trace in fig.data:
         line_width = 5 if getattr(trace, "name", None) == "Today" else 2
@@ -880,7 +1046,10 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
     today_df = today_df.rename(columns={"Ontario Demand": "Today"})
     avg_df = avg_df.rename(columns={"Ontario Demand": "Average"})
 
-    # Get Prophet, XGBoost, and Ensemble forecasts
+    if latest_date.year == 2025 and not include_today_in_training:
+        st.info("Testing mode: comparing 2025 actual demand against forecasts trained from earlier data.")
+
+    # Get Prophet, LightGBM, and Ensemble forecasts
     forecast_df = compute_ensemble_forecast(
         df,
         latest_date,
@@ -920,14 +1089,19 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
         value_vars = [v for v in value_vars if v in merged.columns]
 
     melted = merged.melt(id_vars="Hour", value_vars=value_vars, var_name="Series", value_name="Demand")
+    display_names = {
+        "XGBoost": "LightGBM",
+        "Ensemble": "Ensemble P50",
+    }
+    melted["Series"] = melted["Series"].replace(display_names)
 
     # Define colors for each series
     color_map = {
         "Today": "#1f77b4",
         "Average": "#7f7f7f",
         "Prophet": "#ff7f0e",
-        "XGBoost": "#2ca02c",
-        "Ensemble": "#d62728",
+        "LightGBM": "#2ca02c",
+        "Ensemble P50": "#d62728",
         "Expected Median": "#4d4d4d",
     }
 
@@ -940,6 +1114,37 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
         title=f"{title_prefix} - {latest_date.date()} | {scope_label}",
         markers=True,
     )
+
+    if {"Ensemble_P10", "Ensemble_P90"}.issubset(merged.columns):
+        band = merged[["Hour", "Ensemble_P10", "Ensemble_P90"]].dropna().sort_values("Hour")
+        if not band.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=band["Hour"],
+                    y=band["Ensemble_P90"],
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=band["Hour"],
+                    y=band["Ensemble_P10"],
+                    mode="lines",
+                    fill="tonexty",
+                    fillcolor="rgba(214, 39, 40, 0.14)",
+                    line=dict(width=0),
+                    name="Ensemble P10-P90",
+                    hovertemplate=(
+                        "Hour: %{x}<br>"
+                        "P10: %{y:.1f} MW<br>"
+                        "P90: %{customdata:.1f} MW<extra></extra>"
+                    ),
+                    customdata=band["Ensemble_P90"],
+                )
+            )
 
     style_today_trace(fig)
 
@@ -971,8 +1176,12 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
     fig.update_layout(hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Today vs Expected Accuracy")
+    st.subheader("Actual vs Forecast Accuracy")
     methods = ["Average", "Prophet", "XGBoost", "Ensemble", "Expected Median"]
+    method_labels = {
+        "XGBoost": "LightGBM",
+        "Ensemble": "Ensemble P50",
+    }
     accuracy_rows: list[dict[str, Any]] = []
     for method in methods:
         if method not in merged.columns:
@@ -982,14 +1191,15 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
         if comparison.empty:
             continue
 
-        mae = (comparison["Today"] - comparison[method]).abs().mean()
         accuracy = calculate_accuracy_percentage(comparison["Today"], comparison[method])
+        metrics = calculate_error_metrics(comparison["Today"], comparison[method])
+        if metrics is None:
+            continue
         accuracy_rows.append(
             {
-                "Method": method,
+                "Method": method_labels.get(method, method),
                 "Accuracy %": accuracy,
-                "MAE (MW)": mae,
-                "Compared Hours": len(comparison),
+                **metrics,
             }
         )
 
@@ -999,12 +1209,37 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
             lambda value: "N/A" if value is None else f"{value:.1f}%"
         )
         accuracy_df["MAE (MW)"] = accuracy_df["MAE (MW)"].round(1)
+        accuracy_df["RMSE (MW)"] = accuracy_df["RMSE (MW)"].round(1)
+        accuracy_df["MAPE %"] = accuracy_df["MAPE %"].map(
+            lambda value: "N/A" if value is None else f"{value:.2f}%"
+        )
         st.dataframe(accuracy_df, use_container_width=True, hide_index=True)
 
-    comparison_columns = ["Hour"] + [column for column in methods if column in merged.columns]
+    comparison_columns = ["Hour"] + [
+        column
+        for column in [
+            "Today",
+            "Average",
+            "Prophet",
+            "XGBoost",
+            "Ensemble",
+            "Ensemble_P10",
+            "Ensemble_P90",
+            "Expected Median",
+        ]
+        if column in merged.columns
+    ]
     if len(comparison_columns) > 1:
         st.subheader("Expected Demand Comparison")
-        st.dataframe(merged[comparison_columns].round(1), use_container_width=True)
+        display_comparison = merged[comparison_columns].rename(
+            columns={
+                "XGBoost": "LightGBM",
+                "Ensemble": "Ensemble P50",
+                "Ensemble_P10": "Ensemble P10",
+                "Ensemble_P90": "Ensemble P90",
+            }
+        )
+        st.dataframe(display_comparison.round(1), use_container_width=True)
 
 
 def render_forecast_training_comparison(df, scope_label, baseline=None):
@@ -1117,6 +1352,15 @@ def render_dashboard_content(view, scope, date_range, hour_range, show_normal_ro
         st.warning(f"No data matches the selected scope/filters. Active view: {scope_label}")
     else:
         render_metrics(df_view, total_records_received=total_records_received)
+        
+        # Show forecast status panel
+        st.divider()
+        render_forecast_status_panel()
+        
+        # Show 2025 metrics panel
+        st.divider()
+        render_2025_metrics()
+        
         st.caption(f"Active scope: {scope_label}")
         render_chart(df_view, view, baseline, scope_label)
 
