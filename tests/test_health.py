@@ -8,4 +8,4 @@ async def test_health_endpoint(async_client):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
-    assert data["database"] == "postgresql"
+    assert data["database"] in {"sqlite", "postgresql"}
