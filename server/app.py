@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Any, Optional, cast
 
+import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -1194,6 +1195,127 @@ async def forecast_status(
         "trained_at": cached["trained_at"],
         "error": cached["error"],
     }
+
+
+def calculate_2025_metrics():
+    """Calculate accuracy metrics (MAE, MAPE, RMSE) for 2025 test data."""
+    df = demand_dataframe()
+    
+    # Filter to 2025 data only
+    df_2025 = df[df["Date"].dt.year == 2025].copy() if not df.empty else pd.DataFrame()
+    
+    if df_2025.empty:
+        return {
+            "period": "2025",
+            "available": False,
+            "message": "No 2025 demand records available for testing",
+        }
+    
+    # Get latest fresh forecast
+    cached = get_latest_fresh_forecast(include_target_date=False)
+    
+    if not cached or not cached.get("forecast"):
+        return {
+            "period": "2025",
+            "available": True,
+            "total_records": len(df_2025),
+            "message": "Forecast not available yet",
+            "forecast_status": cached.get("status") if cached else "missing",
+        }
+    
+    # Convert forecast to DataFrame
+    forecast_df = pd.DataFrame(cached["forecast"])
+    
+    # Merge actual demand with forecast
+    # Create hourly forecast dataframe from the daily forecast
+    hourly_forecasts = []
+    for hour_row in forecast_df.to_dict("records"):
+        for date_str in df_2025["Date"].dt.strftime("%Y-%m-%d").unique():
+            hourly_forecasts.append({
+                "Date": date_str,
+                "Hour": hour_row["Hour"],
+                "Ensemble": hour_row.get("Ensemble", 0),
+                "Ensemble_P10": hour_row.get("Ensemble_P10", hour_row.get("Ensemble", 0)),
+                "Ensemble_P90": hour_row.get("Ensemble_P90", hour_row.get("Ensemble", 0)),
+            })
+    
+    hourly_forecast_df = pd.DataFrame(hourly_forecasts)
+    hourly_forecast_df["Date"] = pd.to_datetime(hourly_forecast_df["Date"])
+    
+    # Merge with actual data
+    merged = pd.merge(
+        df_2025[["Date", "Hour", "Ontario Demand"]].copy(),
+        hourly_forecast_df,
+        on=["Date", "Hour"],
+        how="inner",
+    )
+    
+    if merged.empty:
+        return {
+            "period": "2025",
+            "available": True,
+            "total_records": len(df_2025),
+            "message": "No matching forecast data for 2025 records",
+        }
+    
+    # Calculate metrics
+    actual = merged["Ontario Demand"].values
+    forecast = merged["Ensemble"].values
+    
+    # MAE
+    mae = float(np.mean(np.abs(actual - forecast)))
+    
+    # MAPE (Mean Absolute Percentage Error)
+    mape = float(np.mean(np.abs((actual - forecast) / np.maximum(actual, 1.0)))) * 100
+    
+    # RMSE
+    rmse = float(np.sqrt(np.mean((actual - forecast) ** 2)))
+    
+    # Hourly errors
+    merged["Error"] = merged["Ontario Demand"] - merged["Ensemble"]
+    merged["AbsError"] = np.abs(merged["Error"])
+    merged["PercentError"] = (merged["Error"] / np.maximum(merged["Ontario Demand"], 1.0)) * 100
+    
+    hourly_errors = merged.groupby("Hour").agg({
+        "Error": ["mean", "std"],
+        "AbsError": ["mean"],
+        "PercentError": ["mean"],
+        "Ontario Demand": ["count"],
+    }).round(2).to_dict()
+    
+    # Format hourly errors for JSON
+    hourly_errors_formatted = {}
+    for hour in range(24):
+        if hour < len(merged["Hour"].unique()):
+            hour_data = merged[merged["Hour"] == hour]
+            if not hour_data.empty:
+                hourly_errors_formatted[f"H{hour:02d}"] = {
+                    "mean_error": float(hour_data["Error"].mean()),
+                    "mae": float(hour_data["AbsError"].mean()),
+                    "mape": float(hour_data["PercentError"].mean()),
+                    "count": int(hour_data.shape[0]),
+                }
+    
+    return {
+        "period": "2025",
+        "available": True,
+        "total_records": len(df_2025),
+        "forecast_records": len(merged),
+        "metrics": {
+            "MAE": round(mae, 2),
+            "MAPE": round(mape, 2),
+            "RMSE": round(rmse, 2),
+        },
+        "hourly_errors": hourly_errors_formatted,
+        "forecast_status": cached.get("status") if cached else "unknown",
+        "forecast_trained_at": cached.get("trained_at") if cached else None,
+    }
+
+
+@app.get("/forecast/2025-metrics")
+async def forecast_2025_metrics():
+    """Get accuracy metrics for 2025 test data (MAE, MAPE, RMSE)."""
+    return calculate_2025_metrics()
 
 
 @app.get("/stream")
