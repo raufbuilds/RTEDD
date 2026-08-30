@@ -13,8 +13,12 @@ SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
 BASE_URL = f"http://{SERVER_IP}:8000"
 RECORD_COUNT_URL = f"{BASE_URL}/records/count"
 DASHBOARD_DATA_URL = f"{BASE_URL}/dashboard/data"
+FORECAST_URL = f"{BASE_URL}/forecast/latest"
+FORECAST_REFRESH_URL = f"{BASE_URL}/forecast/refresh"
 METRICS_2025_URL = f"{BASE_URL}/forecast/2025-metrics"
-HOURS = list(range(24))
+FORECAST_FRESH_POLL_SECONDS = 30
+FORECAST_POLL_SECONDS = 5
+HOURS = list(range(1, 25))
 
 
 st.set_page_config(
@@ -79,7 +83,7 @@ def ensure_state():
     if "date_range" not in st.session_state:
         st.session_state.date_range = None
     if "hour_range" not in st.session_state:
-        st.session_state.hour_range = (0, 23)
+        st.session_state.hour_range = (1, 24)
     if "show_normal_rows" not in st.session_state:
         st.session_state.show_normal_rows = False
     if "view_mode" not in st.session_state:
@@ -262,7 +266,7 @@ def empty_forecast_frame():
         columns=[
             "Hour",
             "Prophet",
-            "XGBoost",
+            "LightGBM",
             "Ensemble",
             "Ensemble_P10",
             "Ensemble_P50",
@@ -276,10 +280,20 @@ def forecast_frame_from_rows(forecast_rows):
         return empty_forecast_frame()
 
     forecast_df = pd.DataFrame(forecast_rows)
+    legacy_lightgbm_columns = {
+        "XGBoost": "LightGBM",
+        "XGBoost_P10": "LightGBM_P10",
+        "XGBoost_P50": "LightGBM_P50",
+        "XGBoost_P90": "LightGBM_P90",
+    }
+    for legacy_name, current_name in legacy_lightgbm_columns.items():
+        if legacy_name in forecast_df.columns and current_name not in forecast_df.columns:
+            forecast_df[current_name] = forecast_df[legacy_name]
+
     forecast_columns = [
         "Hour",
         "Prophet",
-        "XGBoost",
+        "LightGBM",
         "Ensemble",
         "Ensemble_P10",
         "Ensemble_P50",
@@ -513,7 +527,7 @@ def sidebar_controls(df):
         st.session_state.date_range = date_range
 
     st.sidebar.subheader("Filters")
-    hour_range = st.sidebar.slider("Hour range", 0, 23, key="hour_range")
+    hour_range = st.sidebar.slider("Hour range", 1, 24, key="hour_range")
     show_normal_rows = st.sidebar.checkbox("Show normal rows", key="show_normal_rows")
 
     st.sidebar.caption(f"Loaded records: {len(df)}")
@@ -1080,7 +1094,7 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
             "Today",
             "Average",
             "Prophet",
-            "XGBoost",
+            "LightGBM",
             "Ensemble",
         ]
         value_vars = [v for v in value_vars if v in merged.columns]
@@ -1090,7 +1104,7 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
 
     melted = merged.melt(id_vars="Hour", value_vars=value_vars, var_name="Series", value_name="Demand")
     display_names = {
-        "XGBoost": "LightGBM",
+        "LightGBM": "LightGBM",
         "Ensemble": "Ensemble P50",
     }
     melted["Series"] = melted["Series"].replace(display_names)
@@ -1177,9 +1191,9 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Actual vs Forecast Accuracy")
-    methods = ["Average", "Prophet", "XGBoost", "Ensemble", "Expected Median"]
+    methods = ["Average", "Prophet", "LightGBM", "Ensemble", "Expected Median"]
     method_labels = {
-        "XGBoost": "LightGBM",
+        "LightGBM": "LightGBM",
         "Ensemble": "Ensemble P50",
     }
     accuracy_rows: list[dict[str, Any]] = []
@@ -1221,7 +1235,7 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
             "Today",
             "Average",
             "Prophet",
-            "XGBoost",
+            "LightGBM",
             "Ensemble",
             "Ensemble_P10",
             "Ensemble_P90",
@@ -1233,7 +1247,7 @@ def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_tr
         st.subheader("Expected Demand Comparison")
         display_comparison = merged[comparison_columns].rename(
             columns={
-                "XGBoost": "LightGBM",
+                "LightGBM": "LightGBM",
                 "Ensemble": "Ensemble P50",
                 "Ensemble_P10": "Ensemble P10",
                 "Ensemble_P90": "Ensemble P90",
