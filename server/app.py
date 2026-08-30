@@ -98,7 +98,7 @@ DB_POOL_SIZE = max(1, int(os.getenv("DB_POOL_SIZE", "5")))
 MAX_REQUEST_SIZE_BYTES = int(os.getenv("MAX_REQUEST_SIZE_BYTES", str(1024 * 1024)))
 MAX_BULK_INGEST_ROWS = int(os.getenv("MAX_BULK_INGEST_ROWS", "5000"))
 FORECAST_REFRESH_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))
-FORECAST_XGBOOST_N_JOBS = int(os.getenv("FORECAST_XGBOOST_N_JOBS", "2"))
+FORECAST_LIGHTGBM_N_JOBS = int(os.getenv("FORECAST_LIGHTGBM_N_JOBS", "2"))
 FORECAST_LIGHTGBM_RETRAIN_ROWS = int(os.getenv("FORECAST_LIGHTGBM_RETRAIN_ROWS", "168"))
 WEATHER_LATITUDE = float(os.getenv("WEATHER_LATITUDE", "43.6532"))
 WEATHER_LONGITUDE = float(os.getenv("WEATHER_LONGITUDE", "-79.3832"))
@@ -225,7 +225,7 @@ def demand_dataframe():
     df["Ontario Demand"] = pd.to_numeric(df["Ontario Demand"], errors="coerce")
     df = df.dropna(subset=["Date", "Hour", "Ontario Demand"])
     df["Hour"] = df["Hour"].astype(int)
-    df = df[(df["Hour"] >= 0) & (df["Hour"] <= 23)]
+    df = df[(df["Hour"] >= 1) & (df["Hour"] <= 24)]
     df = df.sort_values(["Date", "Hour", "id"]).reset_index(drop=True)
     df["Timestamp"] = df["Date"] + pd.to_timedelta(df["Hour"], unit="h")
     df["Date Label"] = df["Date"].dt.strftime("%Y-%m-%d")
@@ -287,7 +287,7 @@ def compute_hourly_baseline(df, threshold=3.0, target_date=None, min_points_per_
         return pd.DataFrame(columns=["Hour", "Expected", "Scale", "Lower", "Upper"])
 
     baseline_source["Hour"] = baseline_source["Hour"].astype(int)
-    baseline_source = baseline_source[(baseline_source["Hour"] >= 0) & (baseline_source["Hour"] <= 23)]
+    baseline_source = baseline_source[(baseline_source["Hour"] >= 1) & (baseline_source["Hour"] <= 24)]
     if baseline_source.empty:
         return pd.DataFrame(columns=["Hour", "Expected", "Scale", "Lower", "Upper"])
 
@@ -404,12 +404,17 @@ def forecast_with_prophet(df, target_date=None):
         target_date = df["Date"].max()
 
     future_df = pd.DataFrame(
-        {"ds": [pd.Timestamp(target_date).replace(hour=hour) for hour in range(24)]}
+        {
+            "ds": [
+                pd.Timestamp(target_date).normalize() + pd.to_timedelta(hour, unit="h")
+                for hour in range(1, 25)
+            ]
+        }
     )
     forecast = model.predict(future_df)
     return pd.DataFrame(
         {
-            "Hour": range(24),
+            "Hour": range(1, 25),
             "Prophet Predicted": forecast["yhat"].values,
         }
     )
@@ -491,20 +496,20 @@ def save_model_train_rows(model_path, train_rows):
         pass
 
 
-def forecast_with_xgboost(df, target_date=None):
+def forecast_with_lightgbm(df, target_date=None):
     import os
 
     import joblib
     try:
         import lightgbm as lgb
     except ImportError:
-        return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
+        return pd.DataFrame(columns=["Hour", "LightGBM Predicted"])
     try:
         from server.features import engineer_features, get_feature_cols
     except ImportError:
         from features import engineer_features, get_feature_cols
 
-    columns = ["Hour", "XGBoost Predicted", "XGBoost_P10", "XGBoost_P50", "XGBoost_P90"]
+    columns = ["Hour", "LightGBM Predicted", "LightGBM_P10", "LightGBM_P50", "LightGBM_P90"]
     MODEL_DIR = "models"
     os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -516,7 +521,7 @@ def forecast_with_xgboost(df, target_date=None):
     feature_cols = get_feature_cols(df_feat)
 
     predictions = []
-    for h in range(24):
+    for h in range(1, 25):
         train = df_feat.copy()
         train["target"] = train["Ontario Demand"].shift(-h)
         train = train.dropna(subset=["target"])
@@ -553,7 +558,7 @@ def forecast_with_xgboost(df, target_date=None):
                     reg_alpha=0.05,
                     reg_lambda=0.05,
                     random_state=42,
-                    n_jobs=-1,
+                    n_jobs=FORECAST_LIGHTGBM_N_JOBS,
                     verbose=-1,
                 )
                 model.fit(train[feature_cols], train["target"])
@@ -566,10 +571,10 @@ def forecast_with_xgboost(df, target_date=None):
         predictions.append(
             {
                 "Hour": h,
-                "XGBoost Predicted": horizon_preds["p50"],
-                "XGBoost_P10": horizon_preds["p10"],
-                "XGBoost_P50": horizon_preds["p50"],
-                "XGBoost_P90": horizon_preds["p90"],
+                "LightGBM Predicted": horizon_preds["p50"],
+                "LightGBM_P10": horizon_preds["p10"],
+                "LightGBM_P50": horizon_preds["p50"],
+                "LightGBM_P90": horizon_preds["p90"],
             }
         )
 
@@ -579,53 +584,53 @@ def forecast_with_xgboost(df, target_date=None):
 def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
     training_df = forecast_training_frame(df, target_date, include_target_date)
     prophet_forecast = forecast_with_prophet(training_df, target_date)
-    xgboost_forecast = forecast_with_xgboost(training_df, target_date)
+    lightgbm_forecast = forecast_with_lightgbm(training_df, target_date)
 
     forecast_columns = [
         "Hour",
         "Prophet",
-        "XGBoost",
+        "LightGBM",
         "Ensemble",
         "Ensemble_P10",
         "Ensemble_P50",
         "Ensemble_P90",
     ]
-    if prophet_forecast.empty and xgboost_forecast.empty:
+    if prophet_forecast.empty and lightgbm_forecast.empty:
         return pd.DataFrame(columns=forecast_columns)
 
     if prophet_forecast.empty:
-        result = xgboost_forecast.rename(columns={"XGBoost Predicted": "Ensemble"})
+        result = lightgbm_forecast.rename(columns={"LightGBM Predicted": "Ensemble"})
         result["Prophet"] = result["Ensemble"]
-        result["XGBoost"] = result["Ensemble"]
-        result["Ensemble_P10"] = result.get("XGBoost_P10", result["Ensemble"])
-        result["Ensemble_P50"] = result.get("XGBoost_P50", result["Ensemble"])
-        result["Ensemble_P90"] = result.get("XGBoost_P90", result["Ensemble"])
-    elif xgboost_forecast.empty:
+        result["LightGBM"] = result["Ensemble"]
+        result["Ensemble_P10"] = result.get("LightGBM_P10", result["Ensemble"])
+        result["Ensemble_P50"] = result.get("LightGBM_P50", result["Ensemble"])
+        result["Ensemble_P90"] = result.get("LightGBM_P90", result["Ensemble"])
+    elif lightgbm_forecast.empty:
         result = prophet_forecast.rename(columns={"Prophet Predicted": "Ensemble"})
         result["Prophet"] = result["Ensemble"]
-        result["XGBoost"] = result["Ensemble"]
+        result["LightGBM"] = result["Ensemble"]
         result["Ensemble_P10"] = result["Ensemble"]
         result["Ensemble_P50"] = result["Ensemble"]
         result["Ensemble_P90"] = result["Ensemble"]
     else:
-        merged = pd.merge(prophet_forecast, xgboost_forecast, on="Hour", how="outer")
-        merged["Ensemble"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged["XGBoost Predicted"]
+        merged = pd.merge(prophet_forecast, lightgbm_forecast, on="Hour", how="outer")
+        merged["Ensemble"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged["LightGBM Predicted"]
         merged["Ensemble_P10"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged.get(
-            "XGBoost_P10",
-            merged["XGBoost Predicted"],
+            "LightGBM_P10",
+            merged["LightGBM Predicted"],
         )
         merged["Ensemble_P50"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged.get(
-            "XGBoost_P50",
-            merged["XGBoost Predicted"],
+            "LightGBM_P50",
+            merged["LightGBM Predicted"],
         )
         merged["Ensemble_P90"] = 0.05 * merged["Prophet Predicted"] + 0.95 * merged.get(
-            "XGBoost_P90",
-            merged["XGBoost Predicted"],
+            "LightGBM_P90",
+            merged["LightGBM Predicted"],
         )
         result = merged.rename(
             columns={
                 "Prophet Predicted": "Prophet",
-                "XGBoost Predicted": "XGBoost",
+                "LightGBM Predicted": "LightGBM",
             }
         )
 
@@ -798,7 +803,7 @@ def refresh_forecast_cache(target_date: str, include_target_date: bool):
                 target_date,
                 include_target_date,
                 forecast_cache_signature(df, target_date, include_target_date),
-                pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"]),
+                pd.DataFrame(columns=["Hour", "Prophet", "LightGBM", "Ensemble"]),
                 "empty",
                 "No demand records are available.",
             )
@@ -814,7 +819,7 @@ def refresh_forecast_cache(target_date: str, include_target_date: bool):
             target_date,
             include_target_date,
             None,
-            pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"]),
+            pd.DataFrame(columns=["Hour", "Prophet", "LightGBM", "Ensemble"]),
             "failed",
             str(exc),
         )
@@ -1200,20 +1205,19 @@ async def forecast_status(
 def calculate_2025_metrics():
     """Calculate accuracy metrics (MAE, MAPE, RMSE) for 2025 test data."""
     df = demand_dataframe()
-    
+
     # Filter to 2025 data only
     df_2025 = df[df["Date"].dt.year == 2025].copy() if not df.empty else pd.DataFrame()
-    
+
     if df_2025.empty:
         return {
             "period": "2025",
             "available": False,
             "message": "No 2025 demand records available for testing",
         }
-    
-    # Get latest fresh forecast
+
     cached = get_latest_fresh_forecast(include_target_date=False)
-    
+
     if not cached or not cached.get("forecast"):
         return {
             "period": "2025",
@@ -1222,85 +1226,113 @@ def calculate_2025_metrics():
             "message": "Forecast not available yet",
             "forecast_status": cached.get("status") if cached else "missing",
         }
-    
-    # Convert forecast to DataFrame
+
     forecast_df = pd.DataFrame(cached["forecast"])
-    
-    # Merge actual demand with forecast
-    # Create hourly forecast dataframe from the daily forecast
-    hourly_forecasts = []
-    for hour_row in forecast_df.to_dict("records"):
-        for date_str in df_2025["Date"].dt.strftime("%Y-%m-%d").unique():
-            hourly_forecasts.append({
-                "Date": date_str,
-                "Hour": hour_row["Hour"],
-                "Ensemble": hour_row.get("Ensemble", 0),
-                "Ensemble_P10": hour_row.get("Ensemble_P10", hour_row.get("Ensemble", 0)),
-                "Ensemble_P90": hour_row.get("Ensemble_P90", hour_row.get("Ensemble", 0)),
-            })
-    
-    hourly_forecast_df = pd.DataFrame(hourly_forecasts)
-    hourly_forecast_df["Date"] = pd.to_datetime(hourly_forecast_df["Date"])
-    
-    # Merge with actual data
+    if forecast_df.empty:
+        return {
+            "period": "2025",
+            "available": True,
+            "total_records": len(df_2025),
+            "message": "Forecast not available yet",
+            "forecast_status": cached.get("status") if cached else "missing",
+        }
+
+    forecast_target_date = None
+    if cached.get("target_date"):
+        try:
+            forecast_target_date = pd.Timestamp(cached["target_date"]).normalize()
+        except (TypeError, ValueError):
+            forecast_target_date = None
+
+    if forecast_target_date is None:
+        forecast_target_date = pd.Timestamp(df_2025["Date"].min()).normalize()
+
+    forecast_date_rows = df_2025[df_2025["Date"] == forecast_target_date].copy()
+    if forecast_date_rows.empty:
+        return {
+            "period": "2025",
+            "available": True,
+            "total_records": len(df_2025),
+            "message": "No matching forecast data for 2025 records",
+            "forecast_status": cached.get("status") if cached else "unknown",
+            "forecast_target_date": cached.get("target_date") if cached else None,
+        }
+
+    hourly_forecast_df = pd.DataFrame(
+        [
+            {
+                "Date": forecast_target_date,
+                "Hour": int(hour_row["Hour"]),
+                "Ensemble": float(hour_row.get("Ensemble", 0)),
+                "Ensemble_P10": float(hour_row.get("Ensemble_P10", hour_row.get("Ensemble", 0))),
+                "Ensemble_P90": float(hour_row.get("Ensemble_P90", hour_row.get("Ensemble", 0))),
+            }
+            for hour_row in forecast_df.to_dict("records")
+        ]
+    )
+
+    if hourly_forecast_df.empty:
+        return {
+            "period": "2025",
+            "available": True,
+            "total_records": len(df_2025),
+            "message": "No matching forecast data for 2025 records",
+            "forecast_status": cached.get("status") if cached else "unknown",
+            "forecast_target_date": cached.get("target_date") if cached else None,
+        }
+
     merged = pd.merge(
-        df_2025[["Date", "Hour", "Ontario Demand"]].copy(),
+        forecast_date_rows[["Date", "Hour", "Ontario Demand"]].copy(),
         hourly_forecast_df,
         on=["Date", "Hour"],
         how="inner",
     )
-    
+
     if merged.empty:
         return {
             "period": "2025",
             "available": True,
             "total_records": len(df_2025),
             "message": "No matching forecast data for 2025 records",
+            "forecast_status": cached.get("status") if cached else "unknown",
+            "forecast_target_date": cached.get("target_date") if cached else None,
         }
-    
-    # Calculate metrics
-    actual = merged["Ontario Demand"].values
-    forecast = merged["Ensemble"].values
-    
-    # MAE
+
+    actual = np.asarray(merged["Ontario Demand"].values, dtype=float)
+    forecast = np.asarray(merged["Ensemble"].values, dtype=float)
+
     mae = float(np.mean(np.abs(actual - forecast)))
-    
-    # MAPE (Mean Absolute Percentage Error)
     mape = float(np.mean(np.abs((actual - forecast) / np.maximum(actual, 1.0)))) * 100
-    
-    # RMSE
     rmse = float(np.sqrt(np.mean((actual - forecast) ** 2)))
-    
-    # Hourly errors
+
     merged["Error"] = merged["Ontario Demand"] - merged["Ensemble"]
     merged["AbsError"] = np.abs(merged["Error"])
     merged["PercentError"] = (merged["Error"] / np.maximum(merged["Ontario Demand"], 1.0)) * 100
-    
+
     hourly_errors = merged.groupby("Hour").agg({
         "Error": ["mean", "std"],
         "AbsError": ["mean"],
         "PercentError": ["mean"],
         "Ontario Demand": ["count"],
     }).round(2).to_dict()
-    
-    # Format hourly errors for JSON
+
     hourly_errors_formatted = {}
-    for hour in range(24):
-        if hour < len(merged["Hour"].unique()):
-            hour_data = merged[merged["Hour"] == hour]
-            if not hour_data.empty:
-                hourly_errors_formatted[f"H{hour:02d}"] = {
-                    "mean_error": float(hour_data["Error"].mean()),
-                    "mae": float(hour_data["AbsError"].mean()),
-                    "mape": float(hour_data["PercentError"].mean()),
-                    "count": int(hour_data.shape[0]),
-                }
-    
+    for hour in range(1, 25):
+        hour_data = merged[merged["Hour"] == hour]
+        if not hour_data.empty:
+            hourly_errors_formatted[f"H{hour:02d}"] = {
+                "mean_error": float(hour_data["Error"].mean()),
+                "mae": float(hour_data["AbsError"].mean()),
+                "mape": float(hour_data["PercentError"].mean()),
+                "count": int(hour_data.shape[0]),
+            }
+
     return {
         "period": "2025",
         "available": True,
         "total_records": len(df_2025),
         "forecast_records": len(merged),
+        "forecast_target_date": cached.get("target_date") if cached else None,
         "metrics": {
             "MAE": round(mae, 2),
             "MAPE": round(mape, 2),
