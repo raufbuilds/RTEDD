@@ -123,7 +123,7 @@ def normalize_sender_dataframe(df):
     df["Ontario Demand"] = pd.to_numeric(df.get("Ontario Demand"), errors="coerce")
     df = df.dropna(subset=["Date", "Hour", "Ontario Demand"])
     df["Hour"] = df["Hour"].astype(int)
-    df = df[(df["Hour"] >= 0) & (df["Hour"] <= 23)]
+    df = df[(df["Hour"] >= 1) & (df["Hour"] <= 24)]
     df["Date"] = df["Date"].dt.normalize()
     df = df.sort_values(["Date", "Hour"]).reset_index(drop=True)
     return df
@@ -154,12 +154,14 @@ def send_row(row_dict, row_index):
 
             result = response.json()
             status = result.get("status")
+            date_str = row_dict.get("Date", "N/A")
+            hour_str = row_dict.get("Hour", "N/A")
             if status == "saved":
-                print(f"Sent row {row_index} successfully")
+                print(f"Sent row {row_index} successfully ({date_str} hour {hour_str})")
             elif status == "skipped":
-                print(f"Skipped row {row_index}, already exists")
+                print(f"Skipped row {row_index}, already exists ({date_str} hour {hour_str})")
             else:
-                print(f"Processed row {row_index} with status {status}")
+                print(f"Processed row {row_index} with status {status} ({date_str} hour {hour_str})")
             return True
         except requests.RequestException as exc:
             print(
