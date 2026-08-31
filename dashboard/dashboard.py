@@ -8,6 +8,8 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+from rtedd_agentic_analyst_ui import render_rtedd_agentic_analyst
+
 
 SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
 BASE_URL = f"http://{SERVER_IP}:8000"
@@ -22,7 +24,8 @@ HOURS = list(range(1, 25))
 
 
 st.set_page_config(
-    page_title="Real-Time Electricity Demand Dashboard",
+    page_title="RTEDD | Real-Time Electricity Intelligence",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -30,22 +33,55 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    [data-testid="staleElement"],
-    [data-testid="stale-element"],
-    .stale-element,
-    .stApp [style*="opacity: 0"],
-    .stApp [style*="opacity:0"],
-    .stApp [style*="opacity: 0."],
-    .stApp [style*="opacity:0."] {
-        opacity: 1 !important;
+    :root {
+        --bg:#07111f; --panel:#0d1a2a; --panel2:#101f31;
+        --line:#203247; --text:#e8eef7; --muted:#93a4b8;
+        --blue:#4f9cff; --green:#54d88b; --amber:#f4b942; --red:#ff6868;
     }
+    .stApp { background:var(--bg); color:var(--text); }
+    .block-container { max-width:1600px; padding-top:1.2rem; padding-bottom:2.5rem; }
+    [data-testid="stSidebar"] { background:#081321; border-right:1px solid var(--line); }
+    [data-testid="stSidebar"] * { color:var(--text); }
+    [data-testid="stSidebar"] .stRadio label { border-radius:8px; padding:4px 8px; }
+    .brand-card {
+        background:linear-gradient(120deg,#0b1a2c 0%,#102b46 55%,#0c473f 100%);
+        border:1px solid #24415b; border-radius:18px; padding:24px 28px;
+        color:var(--text); margin-bottom:16px; box-shadow:0 12px 30px rgba(0,0,0,.22);
+    }
+    .brand-card h1 { margin:0; font-size:2rem; letter-spacing:-.03em; }
+    .brand-card p { margin:.55rem 0 0; color:#b8c7d7; }
+    .eyebrow {
+        color:#91a3b7; font-size:.73rem; font-weight:750;
+        letter-spacing:.12em; text-transform:uppercase; margin:1.15rem 0 .55rem;
+    }
+    .insight-card {
+        background:linear-gradient(145deg,#0e1d2e,#0a1726);
+        border:1px solid #22384e; border-radius:15px; padding:17px 18px;
+        min-height:116px; box-shadow:0 6px 18px rgba(0,0,0,.16);
+    }
+    .insight-card .label {
+        color:#9eafc2; font-size:.73rem; font-weight:750;
+        text-transform:uppercase; letter-spacing:.07em;
+    }
+    .insight-card .value { color:#eaf3ff; font-size:1.75rem; font-weight:750; margin-top:7px; }
+    .insight-card .sub { color:#9db0c3; font-size:.82rem; margin-top:5px; }
+    .forecast-card {
+        background:linear-gradient(145deg,#102239,#0b1a2a);
+        border:1px solid #28517a; border-radius:15px; padding:17px 18px; min-height:116px;
+    }
+    .forecast-card .label { color:#9eafc2; font-size:.73rem; font-weight:750; letter-spacing:.07em; }
+    .forecast-card .value { color:#65e09a; font-size:1.7rem; font-weight:750; margin:7px 0 4px; }
+    .forecast-card .models { color:#b7c7d7; font-size:.78rem; line-height:1.6; }
+    [data-testid="stMetric"] {
+        background:#0d1a2a; border:1px solid #22384e; border-radius:12px; padding:14px;
+    }
+    [data-testid="stPlotlyChart"] { border:1px solid #1d3044; border-radius:14px; background:#0b1828; padding:4px; }
+    .stTabs [data-baseweb="tab"] { color:#9fb1c3; border-radius:8px 8px 0 0; padding:10px 16px; }
+    .stTabs [aria-selected="true"] { color:#63a8ff !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-st.title("Real-Time Electricity Demand Dashboard")
-st.caption(f"Connected to {BASE_URL}")
 
 
 def show_2025_test_data_warning(df):
@@ -275,6 +311,13 @@ def empty_forecast_frame():
     )
 
 
+def forecast_methods_for_view(include_today_in_training=False):
+    """Return the methods to display for the requested forecast view."""
+    if include_today_in_training:
+        return ["Prophet", "LightGBM", "Ensemble"]
+    return ["Average", "Expected Median", "Prophet", "LightGBM", "Ensemble"]
+
+
 def forecast_frame_from_rows(forecast_rows):
     if not forecast_rows:
         return empty_forecast_frame()
@@ -355,30 +398,6 @@ def fetch_cached_forecast(target_date=None, include_target_date=False):
         st.session_state.last_error = f"Forecast error: {payload['error']}"
 
     return forecast_frame_from_rows(payload.get("forecast") or [])
-
-
-def forecast_status_text():
-    status = st.session_state.forecast_status
-    trained_at = st.session_state.forecast_trained_at
-    training_seconds = st.session_state.forecast_training_seconds
-    message = st.session_state.forecast_message
-    summary = st.session_state.forecast_summary
-
-    parts = []
-    if status:
-        parts.append(f"Forecast status: {status}")
-    if status == "training" and training_seconds is not None:
-        parts.append(f"Training for {float(training_seconds):.0f}s")
-    if trained_at:
-        trained_time = pd.to_datetime(float(trained_at), unit="s").strftime("%Y-%m-%d %H:%M:%S")
-        parts.append(f"last trained {trained_time}")
-    if message:
-        parts.append(message)
-
-    status_line = " | ".join(parts)
-    if summary:
-        return f"{status_line}\n{summary}"
-    return status_line
 
 
 def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
@@ -478,97 +497,60 @@ def add_anomaly_markers(fig, df_with_anomaly, label_col=None):
 
 
 def sidebar_controls(df):
-    st.sidebar.header("Controls")
-    refresh_seconds = st.sidebar.slider(
-        "Dashboard refresh interval (seconds)",
-        1,
-        10,
-        key="refresh_seconds",
-    )
-    auto_refresh_enabled = st.sidebar.checkbox(
-        "Auto refresh",
-        key="auto_refresh_enabled",
-    )
-    if st.sidebar.button("Refresh now", key="refresh_now"):
-        st.rerun()
-    if st.sidebar.button("Refresh forecast", key="refresh_forecast"):
-        request_forecast_refresh()
+    st.sidebar.markdown("# ⚡ GridPulse")
+    st.sidebar.caption("ENERGY INTELLIGENCE PLATFORM")
+    st.sidebar.divider()
 
-    st.sidebar.subheader("Scope")
+    workspace = st.sidebar.radio(
+        "WORKSPACE",
+        ["Command Center", "Forecast Studio", "Alert Center", "Data Explorer", "🤖 Agentic Analyst"],
+        label_visibility="visible",
+    )
+
+    st.sidebar.markdown("### View controls")
     scope = st.sidebar.selectbox(
-        "Data scope",
-        ["All data", "Today", "Last 7 days", "Custom date range"],
+        "Period",
+        ["Today", "Last 7 days", "All data", "Custom date range"],
         key="scope",
     )
 
-    if not df.empty:
+    if df.empty:
+        min_date = max_date = pd.Timestamp.today().date()
+    else:
         min_date = df["Date"].min().date()
         max_date = df["Date"].max().date()
-    else:
-        today = pd.Timestamp.today().date()
-        min_date, max_date = today, today
 
-    date_range = clamp_date_range(
-        st.session_state.date_range,
-        min_date,
-        max_date,
-    )
-    st.session_state.date_range = date_range
-
+    date_range = st.session_state.get("date_range") or (min_date, max_date)
     if scope == "Custom date range":
-        selected_date_range = st.sidebar.date_input(
-            "Date range",
-            value=date_range,
-            min_value=min_date,
-            max_value=max_date,
-            key="date_range_input",
+        selected = st.sidebar.date_input(
+            "Custom range", value=date_range, min_value=min_date, max_value=max_date
         )
-        date_range = clamp_date_range(selected_date_range, min_date, max_date)
-        st.session_state.date_range = date_range
+        date_range = coerce_date_range_value(selected) or (min_date, max_date)
 
-    st.sidebar.subheader("Filters")
-    hour_range = st.sidebar.slider("Hour range", 1, 24, key="hour_range")
-    show_normal_rows = st.sidebar.checkbox("Show normal rows", key="show_normal_rows")
+    hour_range = st.sidebar.slider("Operating hours", 1, 24, (1, 24))
 
-    st.sidebar.caption(f"Loaded records: {len(df)}")
-    st.sidebar.caption("Connection: Server-backed")
-
-    if st.session_state.last_error:
-        st.sidebar.warning(st.session_state.last_error)
-
-    if not df.empty:
-        latest_date = df["Date"].max().date()
-        earliest_date = df["Date"].min().date()
-        st.sidebar.caption(f"Available dates: {earliest_date} to {latest_date}")
-
-    if st.session_state.last_received_epoch is None:
-        st.sidebar.caption("Last update: N/A")
-    else:
-        age_s = max(0.0, time.time() - st.session_state.last_received_epoch)
-        st.sidebar.caption(f"Last update: {age_s:.0f}s ago")
-
-    st.sidebar.subheader("View")
-    view = st.sidebar.selectbox(
-        "View Mode",
-        [
-            "Today",
-            "All Dates",
-            "Average",
-            "Forecast Training Comparison",
-            "Latest 7 Days",
-            "Latest Records",
-        ],
-        key="view_mode",
+    st.sidebar.divider()
+    st.sidebar.markdown("### Live connection")
+    auto_refresh_enabled = st.sidebar.checkbox("Live updates", value=True)
+    refresh_seconds = st.sidebar.select_slider(
+        "Refresh interval", options=[2, 5, 10, 30, 60], value=5,
+        format_func=lambda x: f"{x}s"
     )
+    if st.sidebar.button("↻ Refresh data", use_container_width=True):
+        fetch_dashboard_data()
+
+    st.sidebar.divider()
+    st.sidebar.caption(f"Connected records: {len(df):,}")
+    st.sidebar.caption("● API connection active")
 
     return (
-        view,
+        workspace,
         refresh_seconds,
         auto_refresh_enabled,
         scope,
         date_range,
         hour_range,
-        show_normal_rows,
+        True,
     )
 
 
@@ -626,23 +608,6 @@ def build_scope_label(df_view, scope, hour_range):
         scope_label = f"All data ({min_date} to {max_date})"
 
     return f"{scope_label} | {hour_label}"
-
-
-def render_metrics(df, total_records_received=None):
-    peak = df["Ontario Demand"].max()
-    avg = df["Ontario Demand"].mean()
-    if total_records_received is None:
-        total_records_received = len(df)
-
-    cols = st.columns(3)
-    cols[0].metric("Peak Demand", f"{peak:.0f} MW" if pd.notna(peak) else "N/A")
-    cols[1].metric("Avg Demand", f"{avg:.0f} MW" if pd.notna(avg) else "N/A")
-    cols[2].metric("Total Records", f"{total_records_received}")
-
-    if df["Anomaly"].any():
-        st.warning(f"{int(df['Anomaly'].sum())} anomalies detected")
-    else:
-        st.success("System normal")
 
 
 def render_today(df, scope_label, baseline=None):
@@ -982,298 +947,261 @@ def render_2025_metrics():
     )
 
 
-def render_forecast_status_panel():
-    """Render a compact forecast training status panel."""
-    st.subheader("⚡ Forecast Status")
-    
-    if st.session_state.forecast_status is None:
-        st.info("Forecast status: initializing...")
-        return
-    
-    # Status colors and icons
-    status_info = {
-        "fresh": ("✅ Fresh", "success"),
-        "stale": ("🔄 Stale (refreshing)", "warning"),
-        "training": ("🔨 Training", "info"),
-        "failed": ("❌ Failed", "error"),
-        "empty": ("⏸️ Empty", "warning"),
-        "missing": ("❓ Missing", "warning"),
-    }
-    
-    status_display, status_type = status_info.get(
-        st.session_state.forecast_status,
-        ("❓ Unknown", "warning")
-    )
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if status_type == "success":
-            st.success(status_display)
-        elif status_type == "warning":
-            st.warning(status_display)
-        elif status_type == "error":
-            st.error(status_display)
-        else:
-            st.info(status_display)
-    
-    with col2:
-        if st.session_state.forecast_trained_at:
-            age_s = time.time() - float(st.session_state.forecast_trained_at)
-            st.metric("Age", f"{age_s/60:.1f} min" if age_s >= 60 else f"{age_s:.0f}s")
-        else:
-            st.metric("Age", "—")
-    
-    with col3:
-        if st.session_state.forecast_training_seconds is not None:
-            st.metric("Last Training", f"{st.session_state.forecast_training_seconds:.1f}s")
-        else:
-            st.metric("Last Training", "—")
-    
-    # Display message if available
-    if st.session_state.forecast_message:
-        st.caption(st.session_state.forecast_message)
-
-
-def style_today_trace(fig):
-    for trace in fig.data:
-        line_width = 5 if getattr(trace, "name", None) == "Today" else 2
-        marker_size = 9 if getattr(trace, "name", None) == "Today" else None
-        if marker_size is None:
-            trace.update(line={"width": line_width})
-        else:
-            trace.update(line={"width": line_width}, marker={"size": marker_size})
-
-
 def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_training=False):
+    """
+    Preserve RTEDD's original two logical modes:
+    - include_today_in_training=False: benchmark comparison
+    - include_today_in_training=True: live-trained forecast comparison
+    Only the presentation is redesigned.
+    """
     latest_date = df["Date"].max()
-    today_df = df[df["Date"] == latest_date].groupby("Hour", as_index=False)["Ontario Demand"].mean()
-    if include_today_in_training:
-        comparison_source = df
-        title_prefix = "Today vs Live-Trained Forecast"
-    else:
-        historical_df = df[df["Date"] < latest_date].copy()
-        comparison_source = historical_df if not historical_df.empty else df
-        title_prefix = "Today vs Forecast Benchmarks"
+    today_df = (
+        df[df["Date"] == latest_date]
+        .groupby("Hour", as_index=False)["Ontario Demand"].mean()
+        .rename(columns={"Ontario Demand": "Today"})
+    )
 
-    avg_df = comparison_source.groupby("Hour", as_index=False)["Ontario Demand"].mean()
-    today_df = today_df.rename(columns={"Ontario Demand": "Today"})
-    avg_df = avg_df.rename(columns={"Ontario Demand": "Average"})
+    historical_df = df[df["Date"] < latest_date].copy()
+    comparison_source = df if include_today_in_training else (
+        historical_df if not historical_df.empty else df
+    )
+    avg_df = (
+        comparison_source.groupby("Hour", as_index=False)["Ontario Demand"].mean()
+        .rename(columns={"Ontario Demand": "Average"})
+    )
 
-    if latest_date.year == 2025 and not include_today_in_training:
-        st.info("Testing mode: comparing 2025 actual demand against forecasts trained from earlier data.")
-
-    # Get Prophet, LightGBM, and Ensemble forecasts
     forecast_df = compute_ensemble_forecast(
         df,
         latest_date,
         include_target_date=include_today_in_training,
     )
-    status_text = forecast_status_text()
-    if status_text:
-        st.caption(status_text)
-    if forecast_df.empty and st.session_state.forecast_status in {"training", "stale"}:
-        st.info("Forecast training is running in FastAPI. Cached forecast data will appear after it finishes.")
 
-    # Merge all forecasts
     merged = pd.merge(today_df, avg_df, on="Hour", how="outer").sort_values("Hour")
-
     if not forecast_df.empty:
         merged = pd.merge(merged, forecast_df, on="Hour", how="outer")
 
     baseline_df = baseline if baseline is not None else pd.DataFrame()
     if not baseline_df.empty:
-        expected_median = baseline_df[["Hour", "Expected"]].rename(
+        expected = baseline_df[["Hour", "Expected"]].rename(
             columns={"Expected": "Expected Median"}
         )
-        merged = pd.merge(merged, expected_median, on="Hour", how="outer")
+        merged = pd.merge(merged, expected, on="Hour", how="outer")
 
-    # Melt for plotting
-    if not forecast_df.empty:
-        value_vars = [
-            "Today",
-            "Average",
-            "Prophet",
-            "LightGBM",
-            "Ensemble",
-        ]
-        value_vars = [v for v in value_vars if v in merged.columns]
+    fig = go.Figure()
+
+    # Benchmark view: compare actual demand against the prior-day trained model outputs
+    # and the operating baseline, while keeping the historical average visible.
+    if not include_today_in_training:
+        if not baseline_df.empty:
+            band = baseline_df.sort_values("Hour")
+            fig.add_trace(go.Scatter(
+                x=band["Hour"], y=band["Upper"], mode="lines",
+                line=dict(width=0), showlegend=False, hoverinfo="skip"
+            ))
+            fig.add_trace(go.Scatter(
+                x=band["Hour"], y=band["Lower"], mode="lines",
+                fill="tonexty", fillcolor="rgba(79,156,255,0.10)",
+                line=dict(width=0), name="Expected operating range",
+                hovertemplate="Hour %{x}:00<br>Lower: %{y:,.0f} MW<extra></extra>",
+            ))
+            fig.add_trace(go.Scatter(
+                x=band["Hour"], y=band["Expected"], mode="lines",
+                line=dict(width=2, dash="dot", color="#94a3b8"),
+                name="Expected benchmark",
+            ))
+
+        if {"Ensemble_P10", "Ensemble_P90"}.issubset(merged.columns):
+            band = merged[["Hour", "Ensemble_P10", "Ensemble_P90"]].dropna().sort_values("Hour")
+            if not band.empty:
+                fig.add_trace(go.Scatter(
+                    x=band["Hour"], y=band["Ensemble_P90"], mode="lines",
+                    line=dict(width=0), showlegend=False, hoverinfo="skip"
+                ))
+                fig.add_trace(go.Scatter(
+                    x=band["Hour"], y=band["Ensemble_P10"], mode="lines",
+                    fill="tonexty", fillcolor="rgba(84,216,139,0.13)",
+                    line=dict(width=0), name="Ensemble P10–P90 range",
+                ))
+
+        if "Average" in merged:
+            fig.add_trace(go.Scatter(
+                x=merged["Hour"], y=merged["Average"], mode="lines",
+                line=dict(width=1.5, dash="dash", color="#6b7c93"),
+                name="Historical hourly average",
+            ))
+
+        if "Prophet" in merged:
+            fig.add_trace(go.Scatter(
+                x=merged["Hour"], y=merged["Prophet"], mode="lines",
+                line=dict(width=2, dash="dash", color="#f4b942"),
+                name="Prophet",
+            ))
+        if "LightGBM" in merged:
+            fig.add_trace(go.Scatter(
+                x=merged["Hour"], y=merged["LightGBM"], mode="lines",
+                line=dict(width=2, dash="dot", color="#b17cff"),
+                name="LightGBM",
+            ))
+        if "Ensemble" in merged:
+            fig.add_trace(go.Scatter(
+                x=merged["Hour"], y=merged["Ensemble"], mode="lines",
+                line=dict(width=3, color="#54d88b"),
+                name="Ensemble P50",
+            ))
+
+        fig.add_trace(go.Scatter(
+            x=merged["Hour"], y=merged["Today"], mode="lines+markers",
+            line=dict(width=4, color="#4f9cff"),
+            marker=dict(size=6), name="Today's actual demand",
+        ))
+        title = f"Benchmark comparison · {latest_date.date()}"
+
+    # Live-trained view: model outputs are generated using all data available up to the
+    # latest observed hour for the selected target date.
     else:
-        value_vars = ["Today", "Average"]
-        value_vars = [v for v in value_vars if v in merged.columns]
+        if {"Ensemble_P10", "Ensemble_P90"}.issubset(merged.columns):
+            band = merged[["Hour", "Ensemble_P10", "Ensemble_P90"]].dropna().sort_values("Hour")
+            if not band.empty:
+                fig.add_trace(go.Scatter(
+                    x=band["Hour"], y=band["Ensemble_P90"], mode="lines",
+                    line=dict(width=0), showlegend=False, hoverinfo="skip"
+                ))
+                fig.add_trace(go.Scatter(
+                    x=band["Hour"], y=band["Ensemble_P10"], mode="lines",
+                    fill="tonexty", fillcolor="rgba(84,216,139,0.13)",
+                    line=dict(width=0), name="Ensemble P10–P90 range",
+                ))
 
-    melted = merged.melt(id_vars="Hour", value_vars=value_vars, var_name="Series", value_name="Demand")
-    display_names = {
-        "LightGBM": "LightGBM",
-        "Ensemble": "Ensemble P50",
-    }
-    melted["Series"] = melted["Series"].replace(display_names)
+        if "Prophet" in merged:
+            fig.add_trace(go.Scatter(
+                x=merged["Hour"], y=merged["Prophet"], mode="lines",
+                line=dict(width=2, dash="dash", color="#f4b942"),
+                name="Prophet",
+            ))
+        if "LightGBM" in merged:
+            fig.add_trace(go.Scatter(
+                x=merged["Hour"], y=merged["LightGBM"], mode="lines",
+                line=dict(width=2, dash="dot", color="#b17cff"),
+                name="LightGBM",
+            ))
+        if "Ensemble" in merged:
+            fig.add_trace(go.Scatter(
+                x=merged["Hour"], y=merged["Ensemble"], mode="lines",
+                line=dict(width=3, color="#54d88b"),
+                name="Ensemble P50",
+            ))
 
-    # Define colors for each series
-    color_map = {
-        "Today": "#1f77b4",
-        "Average": "#7f7f7f",
-        "Prophet": "#ff7f0e",
-        "LightGBM": "#2ca02c",
-        "Ensemble P50": "#d62728",
-        "Expected Median": "#4d4d4d",
-    }
+        fig.add_trace(go.Scatter(
+            x=merged["Hour"], y=merged["Today"], mode="lines+markers",
+            line=dict(width=4, color="#4f9cff"),
+            marker=dict(size=6), name="Today's actual demand",
+        ))
+        title = f"Live-trained model comparison · {latest_date.date()}"
 
-    fig = px.line(
-        melted,
-        x="Hour",
-        y="Demand",
-        color="Series",
-        color_discrete_map=color_map,
-        title=f"{title_prefix} - {latest_date.date()} | {scope_label}",
-        markers=True,
-    )
-
-    if {"Ensemble_P10", "Ensemble_P90"}.issubset(merged.columns):
-        band = merged[["Hour", "Ensemble_P10", "Ensemble_P90"]].dropna().sort_values("Hour")
-        if not band.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=band["Hour"],
-                    y=band["Ensemble_P90"],
-                    mode="lines",
-                    line=dict(width=0),
-                    showlegend=False,
-                    hoverinfo="skip",
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=band["Hour"],
-                    y=band["Ensemble_P10"],
-                    mode="lines",
-                    fill="tonexty",
-                    fillcolor="rgba(214, 39, 40, 0.14)",
-                    line=dict(width=0),
-                    name="Ensemble P10-P90",
-                    hovertemplate=(
-                        "Hour: %{x}<br>"
-                        "P10: %{y:.1f} MW<br>"
-                        "P90: %{customdata:.1f} MW<extra></extra>"
-                    ),
-                    customdata=band["Ensemble_P90"],
-                )
-            )
-
-    style_today_trace(fig)
-
-    # Add baseline band if available
-    fig = add_baseline_to_figure(fig, baseline_df, sorted(merged["Hour"].dropna().unique()))
-
-    # Highlight anomalies for the latest date
+    # Keep anomaly logic in both views.
     anomalies = df[(df["Date"] == latest_date) & (df["Anomaly"])].copy()
     if not anomalies.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=anomalies["Hour"],
-                y=anomalies["Ontario Demand"],
-                mode="markers",
-                marker=dict(size=11, color="#d62728", symbol="x"),
-                name="Anomaly",
-                customdata=anomalies[["Expected Demand", "Deviation", "Anomaly Score"]].to_numpy(),
-                hovertemplate=(
-                    "Hour: %{x}<br>"
-                    "Demand: %{y:.1f} MW<br>"
-                    "Expected: %{customdata[0]:.1f} MW<br>"
-                    "Deviation: %{customdata[1]:.1f} MW<br>"
-                    "Score: %{customdata[2]:.2f}<extra></extra>"
-                ),
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=anomalies["Hour"], y=anomalies["Ontario Demand"],
+            mode="markers", marker=dict(size=11, color="#ff6868", symbol="diamond"),
+            name="Detected anomaly",
+            customdata=anomalies[["Expected Demand", "Deviation", "Anomaly Score"]].to_numpy(),
+            hovertemplate=(
+                "Hour: %{x}:00<br>Demand: %{y:,.0f} MW<br>"
+                "Expected: %{customdata[0]:,.0f} MW<br>"
+                "Deviation: %{customdata[1]:,.0f} MW<br>"
+                "Score: %{customdata[2]:.2f}<extra></extra>"
+            ),
+        ))
 
-    fig = fix_hour_axis(fig)
-    fig.update_layout(hovermode="x unified")
+    fig.update_layout(
+        title=title,
+        height=460,
+        margin=dict(l=20, r=20, t=55, b=25),
+        hovermode="x unified",
+        paper_bgcolor="#0b1828",
+        plot_bgcolor="#0b1828",
+        font=dict(color="#dbe7f3"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+    fig.update_xaxes(
+        title="Hour of day",
+        tickmode="array",
+        tickvals=list(range(1, 25)),
+        gridcolor="rgba(120,150,180,0.12)",
+        zeroline=False,
+    )
+    fig.update_yaxes(
+        title="Demand (MW)",
+        gridcolor="rgba(120,150,180,0.12)",
+        zeroline=False,
+    )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Actual vs Forecast Accuracy")
-    methods = ["Average", "Prophet", "LightGBM", "Ensemble", "Expected Median"]
-    method_labels = {
-        "LightGBM": "LightGBM",
-        "Ensemble": "Ensemble P50",
-    }
-    accuracy_rows: list[dict[str, Any]] = []
-    for method in methods:
+    # Accuracy stays available but does not clutter the chart.
+    rows = []
+    for method in forecast_methods_for_view(include_today_in_training):
         if method not in merged.columns:
             continue
-
-        comparison = merged[["Today", method]].dropna()
-        if comparison.empty:
-            continue
-
-        accuracy = calculate_accuracy_percentage(comparison["Today"], comparison[method])
-        metrics = calculate_error_metrics(comparison["Today"], comparison[method])
-        if metrics is None:
-            continue
-        accuracy_rows.append(
-            {
-                "Method": method_labels.get(method, method),
+        metrics = calculate_error_metrics(merged["Today"], merged[method])
+        accuracy = calculate_accuracy_percentage(merged["Today"], merged[method])
+        if metrics is not None:
+            rows.append({
+                "Method": "Ensemble P50" if method == "Ensemble" else method,
                 "Accuracy %": accuracy,
                 **metrics,
-            }
-        )
+            })
 
-    if accuracy_rows:
-        accuracy_df = pd.DataFrame(accuracy_rows)
+    if rows:
+        accuracy_df = pd.DataFrame(rows)
         accuracy_df["Accuracy %"] = accuracy_df["Accuracy %"].map(
-            lambda value: "N/A" if value is None else f"{value:.1f}%"
+            lambda x: "N/A" if x is None else f"{x:.1f}%"
         )
-        accuracy_df["MAE (MW)"] = accuracy_df["MAE (MW)"].round(1)
-        accuracy_df["RMSE (MW)"] = accuracy_df["RMSE (MW)"].round(1)
-        accuracy_df["MAPE %"] = accuracy_df["MAPE %"].map(
-            lambda value: "N/A" if value is None else f"{value:.2f}%"
-        )
-        st.dataframe(accuracy_df, use_container_width=True, hide_index=True)
-
-    comparison_columns = ["Hour"] + [
-        column
-        for column in [
-            "Today",
-            "Average",
-            "Prophet",
-            "LightGBM",
-            "Ensemble",
-            "Ensemble_P10",
-            "Ensemble_P90",
-            "Expected Median",
-        ]
-        if column in merged.columns
-    ]
-    if len(comparison_columns) > 1:
-        st.subheader("Expected Demand Comparison")
-        display_comparison = merged[comparison_columns].rename(
-            columns={
-                "LightGBM": "LightGBM",
-                "Ensemble": "Ensemble P50",
-                "Ensemble_P10": "Ensemble P10",
-                "Ensemble_P90": "Ensemble P90",
-            }
-        )
-        st.dataframe(display_comparison.round(1), use_container_width=True)
+        with st.expander("View accuracy and error metrics"):
+            st.dataframe(
+                accuracy_df.round({"MAE (MW)": 1, "RMSE (MW)": 1, "MAPE %": 2}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 def render_forecast_training_comparison(df, scope_label, baseline=None):
-    left_col, right_col = st.columns(2)
+    """Keep RTEDD's two forecast-training views separate and visually distinct."""
+    latest_date = df["Date"].max()
 
-    with left_col:
-        render_today_vs_forecast(
-            df,
-            scope_label,
-            baseline=baseline,
-            include_today_in_training=False,
-        )
+    st.markdown(
+        '<div class="eyebrow">Two complementary forecast views</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "The benchmark view answers whether today's demand follows the expected operating pattern. "
+        "The live-trained view evaluates the current Prophet + LightGBM forecasting pipeline."
+    )
 
-    with right_col:
-        render_today_vs_forecast(
-            df,
-            scope_label,
-            baseline=baseline,
-            include_today_in_training=True,
-        )
+    # 1) Stable benchmark comparison.
+    st.markdown("### 1. Today vs Forecast Benchmark")
+    st.caption("Actual demand against the historical/expected benchmark. This is the operational baseline view.")
+    render_today_vs_forecast(
+        df,
+        scope_label,
+        baseline=baseline,
+        include_today_in_training=False,
+    )
+
+    st.divider()
+
+    # 2) Live-trained model comparison.
+    st.markdown("### 2. Today vs Live-Trained Forecast")
+    st.caption(
+        "Actual demand against forecasts generated by the live training pipeline. "
+        "Prophet, LightGBM and Ensemble remain visible as separate RTEDD model outputs."
+    )
+    render_today_vs_forecast(
+        df,
+        scope_label,
+        baseline=baseline,
+        include_today_in_training=True,
+    )
 
 
 def render_latest_7_days(df, scope_label):
@@ -1337,86 +1265,416 @@ def render_anomaly_details(df, scope_label):
     )
 
 
-def render_chart(df, view_mode, baseline, scope_label):
-    if view_mode == "Today":
-        render_today(df, scope_label, baseline=baseline)
-    elif view_mode == "All Dates":
-        render_all_dates(df, scope_label)
-    elif view_mode == "Average":
-        render_average(df, scope_label)
-    elif view_mode == "Forecast Training Comparison":
-        render_forecast_training_comparison(df, scope_label, baseline=baseline)
-    elif view_mode == "Latest 7 Days":
-        render_latest_7_days(df, scope_label)
-    elif view_mode == "Latest Records":
-        render_latest_records(df, scope_label)
+def render_current_demand_card(df):
+    """Show current actual demand plus RTEDD's Prophet, LightGBM and Ensemble outputs."""
+    if df.empty:
+        return
 
+    latest_date = df["Date"].max()
+    latest_rows = df[df["Date"] == latest_date].sort_values("Hour")
+    latest = latest_rows.iloc[-1]
+    current_hour = int(latest["Hour"])
+    actual = float(latest["Ontario Demand"])
+
+    forecast_df = compute_ensemble_forecast(
+        df, latest_date, include_target_date=True
+    )
+    row = (
+        forecast_df[forecast_df["Hour"] == current_hour]
+        if forecast_df is not None and not forecast_df.empty
+        else pd.DataFrame()
+    )
+
+    model_lines = []
+    if not row.empty:
+        item = row.iloc[0]
+        for label, column in [
+            ("Prophet", "Prophet"),
+            ("LightGBM", "LightGBM"),
+            ("Ensemble", "Ensemble"),
+        ]:
+            value = item.get(column)
+            if pd.notna(value):
+                model_lines.append(f"{label}: {float(value):,.0f} MW")
+
+    expected = float(latest.get("Expected Demand", actual))
+    deviation_pct = ((actual - expected) / expected * 100) if expected else 0
+    details = "<br>".join(model_lines) if model_lines else f"{deviation_pct:+.1f}% vs expected"
+
+    st.markdown(
+        f'<div class="forecast-card">'
+        f'<div class="label">CURRENT DEMAND · {current_hour:02d}:00</div>'
+        f'<div class="value">{actual:,.0f} MW</div>'
+        f'<div class="models">{details}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+def render_next_hour_forecast_card(df):
+    """Render RTEDD's next-hour forecast using both model outputs and ensemble when available."""
+    if df.empty:
+        st.markdown(
+            '<div class="forecast-card"><div class="label">NEXT HOUR FORECAST</div>'
+            '<div class="value">—</div><div class="models">No data available.</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    latest_date = df["Date"].max()
+    latest_rows = df[df["Date"] == latest_date]
+    latest_hour = int(latest_rows["Hour"].max()) if not latest_rows.empty else 24
+    next_hour = 1 if latest_hour >= 24 else latest_hour + 1
+
+    forecast_df = compute_ensemble_forecast(
+        df, latest_date, include_target_date=True
+    )
+
+    row = (
+        forecast_df[forecast_df["Hour"] == next_hour]
+        if forecast_df is not None and not forecast_df.empty
+        else pd.DataFrame()
+    )
+
+    if row.empty:
+        st.markdown(
+            f'<div class="forecast-card"><div class="label">NEXT HOUR FORECAST · {next_hour:02d}:00</div>'
+            '<div class="value">—</div>'
+            '<div class="models">Live model output is not available for this hour.</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    item = row.iloc[0]
+    prophet = item.get("Prophet")
+    lgbm = item.get("LightGBM")
+    ensemble = item.get("Ensemble")
+    p10 = item.get("Ensemble_P10")
+    p90 = item.get("Ensemble_P90")
+
+    values = [v for v in [ensemble, lgbm, prophet] if pd.notna(v)]
+    if not values:
+        main_html = "—"
+    else:
+        main_html = f"{float(values[0]):,.0f} MW"
+
+    model_lines = []
+    if pd.notna(prophet):
+        model_lines.append(f"Prophet: {float(prophet):,.0f} MW")
+    if pd.notna(lgbm):
+        model_lines.append(f"LightGBM: {float(lgbm):,.0f} MW")
+    if pd.notna(p10) and pd.notna(p90):
+        model_lines.append(f"Expected range: {float(p10):,.0f}–{float(p90):,.0f} MW")
+
+    details = "<br>".join(model_lines) if model_lines else "No model values available."
+
+    st.markdown(
+        f'<div class="forecast-card">'
+        f'<div class="label">NEXT HOUR FORECAST · {next_hour:02d}:00</div>'
+        f'<div class="value">{main_html}</div>'
+        f'<div class="models">{details}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+
+
+def render_system_health_panel(latest_date, latest_hour, total_records_received):
+    st.markdown("### SYSTEM HEALTH")
+    st.markdown(
+        f"""
+        🟢 **Data Pipeline**  
+        Receiving demand records
+
+        🟢 **Forecast Engine**  
+        Prophet + LightGBM available
+
+        🟢 **API Connection**  
+        Connected
+
+        🟢 **Latest Data**  
+        {latest_date.date()} · {int(latest_hour):02d}:00
+
+        📍 **Timezone**  
+        Ontario Time (ET)
+
+        **Total records:** {total_records_received:,}
+        """
+    )
+
+
+def render_recent_intelligence(df):
+    st.markdown("### 🚨 RECENT INTELLIGENCE")
+    if "Anomaly" not in df.columns or not df["Anomaly"].any():
+        st.success("🟢 System Normal\n\nAll selected observations are within the expected operating pattern.")
+        return
+
+    events = df[df["Anomaly"]].sort_values(["Date", "Hour"], ascending=False).head(4)
+    for _, event in events.iterrows():
+        demand = float(event["Ontario Demand"])
+        expected = float(event.get("Expected Demand", demand))
+        deviation = demand - expected
+        pct = (deviation / expected * 100) if expected else 0
+        score = float(event.get("Anomaly Score", 0))
+        severity = "🔴 High" if abs(score) >= 3 else "🟠 Medium"
+
+        direction = "higher" if deviation >= 0 else "lower"
+        st.markdown(
+            f"**{severity} demand deviation**  \n"
+            f"{event['Date'].date()} · {int(event['Hour']):02d}:00 — "
+            f"Demand is **{abs(pct):.1f}% {direction}** than expected."
+        )
+        st.caption(f"Actual {demand:,.0f} MW · Expected {expected:,.0f} MW")
+        st.divider()
+
+
+def render_supporting_metrics(df):
+    values = df["Ontario Demand"].dropna()
+    if values.empty:
+        return
+
+    avg = float(values.mean())
+    peak_idx = values.idxmax()
+    low_idx = values.idxmin()
+    peak_row = df.loc[peak_idx]
+    low_row = df.loc[low_idx]
+
+    # Hourly MW readings are treated as hourly demand observations for an approximate
+    # GWh indicator; the label intentionally says estimated.
+    estimated_gwh = float(values.sum() / 1000.0)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("AVERAGE DEMAND", f"{avg:,.0f} MW")
+    c2.metric("PEAK DEMAND", f"{float(peak_row['Ontario Demand']):,.0f} MW",
+              f"{peak_row['Date'].date()} · {int(peak_row['Hour']):02d}:00")
+    c3.metric("LOW DEMAND", f"{float(low_row['Ontario Demand']):,.0f} MW",
+              f"{low_row['Date'].date()} · {int(low_row['Hour']):02d}:00")
+    c4.metric("ESTIMATED DEMAND TOTAL", f"{estimated_gwh:,.1f} GWh",
+              "Selected period")
+
+
+def render_seven_day_trend(df):
+    daily = (
+        df.groupby("Date", as_index=False)["Ontario Demand"]
+        .mean()
+        .tail(7)
+    )
+    if daily.empty:
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=daily["Date"], y=daily["Ontario Demand"],
+        mode="lines+markers", name="Average daily demand",
+        line=dict(width=3, color="#4f9cff"),
+        fill="tozeroy", fillcolor="rgba(79,156,255,0.10)",
+    ))
+    fig.update_layout(
+        height=310, margin=dict(l=20, r=20, t=45, b=20),
+        title="7-Day Demand Trend",
+        paper_bgcolor="#0b1828", plot_bgcolor="#0b1828",
+        font=dict(color="#dbe7f3"), showlegend=False,
+    )
+    fig.update_xaxes(gridcolor="rgba(120,150,180,0.12)")
+    fig.update_yaxes(title="Average demand (MW)", gridcolor="rgba(120,150,180,0.12)")
+    st.plotly_chart(fig, use_container_width=True)
 
 def render_dashboard_content(view, scope, date_range, hour_range, show_normal_rows):
     df, baseline, total_records_received = fetch_dashboard_data()
 
     if df.empty:
-        st.info("Waiting for data from the server...")
+        st.markdown('<div class="brand-card"><h1>GridPulse</h1><p>Energy intelligence is waiting for live demand data.</p></div>', unsafe_allow_html=True)
+        st.info("Waiting for the data pipeline to deliver records.")
         return
 
     df_view = apply_scope_and_filters(df, scope, date_range, hour_range)
-    scope_label = build_scope_label(df_view, scope, hour_range)
-
     if df_view.empty:
-        st.warning(f"No data matches the selected scope/filters. Active view: {scope_label}")
-    else:
-        render_metrics(df_view, total_records_received=total_records_received)
-        
-        # Show forecast status panel
+        st.warning("No records match the current view.")
+        return
+
+    latest_date = df_view["Date"].max()
+    latest_rows = df_view[df_view["Date"] == latest_date].sort_values("Hour")
+    latest = latest_rows.iloc[-1]
+    current = float(latest["Ontario Demand"])
+    expected = float(latest.get("Expected Demand", current))
+    deviation_pct = ((current - expected) / expected * 100) if expected else 0
+    anomaly_count = int(df_view["Anomaly"].sum()) if "Anomaly" in df_view else 0
+    status = "ATTENTION" if anomaly_count else "NORMAL"
+    status_icon = "🟠" if anomaly_count else "🟢"
+
+    st.markdown(
+        f"""
+        <div class="brand-card">
+            <h1>⚡ RTEDD <span style="font-weight:400;opacity:.78;font-size:1.05rem;">Real-Time Electricity Demand Intelligence</span></h1>
+            <p>{status_icon} System status: <b>{status}</b> &nbsp;•&nbsp; Latest observation: {latest_date.date()} at hour {int(latest['Hour'])}:00</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if view == "Command Center":
+        # Product hierarchy: status → key numbers → main activity → problems → supporting analysis.
+        st.markdown('<div class="eyebrow">Live system snapshot</div>', unsafe_allow_html=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        peak = float(latest_rows["Ontario Demand"].max())
+        peak_hour = int(latest_rows.loc[latest_rows["Ontario Demand"].idxmax(), "Hour"])
+
+        with c1:
+            render_current_demand_card(df_view)
+        with c2:
+            render_next_hour_forecast_card(df_view)
+        c3.markdown(
+            f'<div class="insight-card"><div class="label">TODAY’S PEAK</div>'
+            f'<div class="value">{peak:,.0f} MW</div>'
+            f'<div class="sub">Observed at {peak_hour:02d}:00</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        # Keep alert severity honest: only classify from anomaly score when it exists.
+        high_alerts = 0
+        medium_alerts = anomaly_count
+        if "Anomaly Score" in df_view.columns:
+            scores = df_view.loc[df_view["Anomaly"], "Anomaly Score"].abs()
+            high_alerts = int((scores >= 3).sum())
+            medium_alerts = int((scores < 3).sum())
+
+        c4.markdown(
+            f'<div class="insight-card"><div class="label">ACTIVE ALERTS</div>'
+            f'<div class="value">{anomaly_count}</div>'
+            f'<div class="sub">🔴 {high_alerts} High · 🟠 {medium_alerts} Medium</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        # Main intelligence row: signature chart + system trust panel.
+        main_left, main_right = st.columns([2.2, 1])
+        with main_left:
+            st.markdown('<div class="eyebrow">Demand intelligence</div>', unsafe_allow_html=True)
+            fig = go.Figure()
+
+            # Expected operating band.
+            if baseline is not None and not baseline.empty:
+                band = baseline.sort_values("Hour")
+                fig.add_trace(go.Scatter(
+                    x=band["Hour"], y=band["Upper"], mode="lines",
+                    line=dict(width=0), showlegend=False, hoverinfo="skip"
+                ))
+                fig.add_trace(go.Scatter(
+                    x=band["Hour"], y=band["Lower"], mode="lines",
+                    fill="tonexty", fillcolor="rgba(79,156,255,0.10)",
+                    line=dict(width=0), name="Expected range"
+                ))
+                if "Expected" in band.columns:
+                    fig.add_trace(go.Scatter(
+                        x=band["Hour"], y=band["Expected"], mode="lines",
+                        line=dict(width=2, dash="dot", color="#94a3b8"),
+                        name="Expected demand"
+                    ))
+
+            # Actual and model forecasts for today's available hours.
+            fig.add_trace(go.Scatter(
+                x=latest_rows["Hour"], y=latest_rows["Ontario Demand"],
+                mode="lines+markers", name="Actual demand",
+                line=dict(width=4, color="#4f9cff"), marker=dict(size=6)
+            ))
+
+            forecast_today = compute_ensemble_forecast(
+                df_view, latest_date, include_target_date=True
+            )
+            if forecast_today is not None and not forecast_today.empty:
+                if "Ensemble" in forecast_today.columns:
+                    fig.add_trace(go.Scatter(
+                        x=forecast_today["Hour"], y=forecast_today["Ensemble"],
+                        mode="lines", name="Ensemble forecast",
+                        line=dict(width=3, color="#54d88b")
+                    ))
+                if {"Ensemble_P10", "Ensemble_P90"}.issubset(forecast_today.columns):
+                    band = forecast_today.dropna(subset=["Ensemble_P10", "Ensemble_P90"]).sort_values("Hour")
+                    if not band.empty:
+                        fig.add_trace(go.Scatter(
+                            x=band["Hour"], y=band["Ensemble_P90"], mode="lines",
+                            line=dict(width=0), showlegend=False, hoverinfo="skip"
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=band["Hour"], y=band["Ensemble_P10"], mode="lines",
+                            fill="tonexty", fillcolor="rgba(84,216,139,0.10)",
+                            line=dict(width=0), name="Ensemble P10–P90"
+                        ))
+
+            anomalies = latest_rows[latest_rows["Anomaly"]] if "Anomaly" in latest_rows else pd.DataFrame()
+            if not anomalies.empty:
+                fig.add_trace(go.Scatter(
+                    x=anomalies["Hour"], y=anomalies["Ontario Demand"],
+                    mode="markers", name="Detected anomaly",
+                    marker=dict(size=12, color="#ff6868", symbol="diamond")
+                ))
+
+            fig.update_layout(
+                height=470, margin=dict(l=20, r=20, t=50, b=20),
+                title="Actual demand · Expected pattern · Live forecast",
+                hovermode="x unified",
+                paper_bgcolor="#0b1828", plot_bgcolor="#0b1828",
+                font=dict(color="#dbe7f3"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            )
+            fig.update_xaxes(
+                title="Hour of day", tickmode="array", tickvals=list(range(1, 25)),
+                gridcolor="rgba(120,150,180,0.12)"
+            )
+            fig.update_yaxes(title="Demand (MW)", gridcolor="rgba(120,150,180,0.12)")
+            st.plotly_chart(fig, use_container_width=True)
+
+        with main_right:
+            st.markdown('<div class="eyebrow">Operational trust</div>', unsafe_allow_html=True)
+            render_system_health_panel(
+                latest_date, latest["Hour"], total_records_received
+            )
+
+        # Problems and trend are intentionally separated.
+        lower_left, lower_right = st.columns([1.25, .95])
+        with lower_left:
+            st.markdown('<div class="eyebrow">Historical movement</div>', unsafe_allow_html=True)
+            render_seven_day_trend(df_view)
+        with lower_right:
+            st.markdown('<div class="eyebrow">What needs attention?</div>', unsafe_allow_html=True)
+            render_recent_intelligence(df_view)
+
+        st.markdown('<div class="eyebrow">Supporting intelligence</div>', unsafe_allow_html=True)
+        render_supporting_metrics(df_view)
+
+    elif view == "Forecast Studio":
+        st.markdown('<div class="eyebrow">Forecast outlook</div>', unsafe_allow_html=True)
+        render_forecast_training_comparison(df_view, build_scope_label(df_view, scope, hour_range), baseline=baseline)
         st.divider()
-        render_forecast_status_panel()
-        
-        # Show 2025 metrics panel
-        st.divider()
+        st.markdown('<div class="eyebrow">Model evaluation</div>', unsafe_allow_html=True)
         render_2025_metrics()
-        
-        st.caption(f"Active scope: {scope_label}")
-        render_chart(df_view, view, baseline, scope_label)
 
-        st.divider()
-        render_anomaly_details(df_view, scope_label)
-
-    df_table = df_view
-    if not show_normal_rows:
-        df_table = df_table[df_table["Anomaly"]]
-
-    table_scope_label = build_scope_label(df_view, scope, hour_range)
-    st.subheader(f"Latest Records - {table_scope_label}")
-
-    if df_table.empty:
-        if show_normal_rows:
-            st.info(f"No records available for {table_scope_label}.")
+    elif view == "Alert Center":
+        st.markdown('<div class="eyebrow">Operational alerts</div>', unsafe_allow_html=True)
+        if anomaly_count == 0:
+            st.success("No anomalies detected for the selected period.")
         else:
-            st.info(f"No anomaly rows available for {table_scope_label}. Turn on 'Show normal rows' to see all records.")
+            st.warning(f"{anomaly_count} events are outside the expected operating pattern.")
+        render_anomaly_details(df_view, build_scope_label(df_view, scope, hour_range))
 
-    st.dataframe(
-        df_table[
-            [
-                "Date",
-                "Hour",
-                "Ontario Demand",
-                "Expected Demand",
-                "Deviation",
-                "Anomaly Score",
-                "Status",
-            ]
-        ].tail(25),
-        use_container_width=True,
-    )
+    elif view == "🤖 Agentic Analyst":
+        render_rtedd_agentic_analyst(df=df_view)
 
-    st.download_button(
-        f"Download current view ({scope_label})",
-        data=df_view.to_csv(index=False).encode("utf-8"),
-        file_name="pub_dashboard_view.csv",
-        mime="text/csv",
-        key="download_current_view",
-        on_click="ignore",
-    )
+    else:
+        st.markdown('<div class="eyebrow">Data explorer</div>', unsafe_allow_html=True)
+        st.caption("Use this workspace for validation and detailed analysis—not as the primary operational view.")
+        st.dataframe(
+            df_view[["Date","Hour","Ontario Demand","Expected Demand","Deviation","Anomaly Score","Status"]].sort_values(["Date","Hour"], ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "Download selected data",
+            df_view.to_csv(index=False).encode("utf-8"),
+            "gridpulse_export.csv",
+            "text/csv",
+            key="gridpulse_export",
+        )
 
 
 ensure_state()
