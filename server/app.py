@@ -99,7 +99,10 @@ MAX_REQUEST_SIZE_BYTES = int(os.getenv("MAX_REQUEST_SIZE_BYTES", str(1024 * 1024
 MAX_BULK_INGEST_ROWS = int(os.getenv("MAX_BULK_INGEST_ROWS", "5000"))
 FORECAST_REFRESH_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))
 FORECAST_LIGHTGBM_N_JOBS = int(os.getenv("FORECAST_LIGHTGBM_N_JOBS", "2"))
-FORECAST_LIGHTGBM_RETRAIN_ROWS = int(os.getenv("FORECAST_LIGHTGBM_RETRAIN_ROWS", "168"))
+# Live models should retrain whenever new actual data arrives; the benchmark view keeps its
+# own separate historical-only window. Keep the env as a compatibility knob, but default it
+# to 1 row so the live model updates immediately on each new observation.
+FORECAST_LIGHTGBM_RETRAIN_ROWS = int(os.getenv("FORECAST_LIGHTGBM_RETRAIN_ROWS", "1"))
 WEATHER_LATITUDE = float(os.getenv("WEATHER_LATITUDE", "43.6532"))
 WEATHER_LONGITUDE = float(os.getenv("WEATHER_LONGITUDE", "-79.3832"))
 
@@ -345,6 +348,11 @@ def compute_hourly_baseline(df, threshold=3.0, target_date=None, min_points_per_
 
 
 def forecast_training_frame(df, target_date=None, include_target_date=False):
+    """Return the correct training window for each forecast view.
+
+    Benchmark mode is strict: training must exclude the target day.
+    Live-trained mode uses all available data up to the latest observation.
+    """
     if df.empty:
         return df
 
@@ -352,13 +360,13 @@ def forecast_training_frame(df, target_date=None, include_target_date=False):
         target_date = df["Date"].max()
 
     if include_target_date:
+        # Real-time model: use all data available up to the latest observed timestamp.
+        # This is the current production training window for the live model.
         return df.copy()
 
     historical_df = df[df["Date"] < pd.Timestamp(target_date)].copy()
-    if len(historical_df) >= 48:
-        return historical_df
-
-    return df.copy()
+    # Benchmark mode never leaks the target day into training, even if the history is short.
+    return historical_df
 
 
 def forecast_cache_signature(df, target_date=None, include_target_date=False):
@@ -539,11 +547,15 @@ def forecast_with_lightgbm(df, target_date=None):
             if os.path.exists(model_path):
                 model = joblib.load(model_path)
                 train_rows = load_model_train_rows(model_path)
-                if (
-                    train_rows is not None
-                    and (current_train_rows - train_rows) < FORECAST_LIGHTGBM_RETRAIN_ROWS
-                ):
+                # True live training: every new actual row should refresh the model before the
+                # next forecast. The historic benchmark view is separate and should not use this
+                # same retrain gate.
+                if train_rows is not None and current_train_rows == train_rows:
                     retrain = False
+                elif train_rows is None:
+                    retrain = True
+                elif current_train_rows > train_rows:
+                    retrain = True
 
             if model is None or retrain:
                 model = lgb.LGBMRegressor(
@@ -1067,6 +1079,10 @@ async def forecast_latest(
 
     if is_missing or is_stale or (cached and cached.get("status") == "failed"):
         schedule_forecast_refresh(background_tasks, normalized_target_date, include_target_date)
+
+    # For the live-trained view, use the full training window and let the LightGBM retrain
+    # cadence decide when to refresh the forecast. For benchmark mode, the window is strictly
+    # prior to target_date and should be isolated from live-model retraining semantics.
 
     if cached is None:
         fallback = get_latest_fresh_forecast(include_target_date)
